@@ -1,17 +1,15 @@
 // ==UserScript==
-// @name         Ozon Scraper - 四层类目树采集 + MD导出
+// @name         Ozon Scraper - 四层类目树 + 悬停展开 + 面板保活
 // @namespace    https://github.com/vision-png/ozon
-// @version      4.0.0
-// @description  采集 Ozon.ru 类目树（一级→二级→三级→四级），导出 CSV / Excel / Markdown
+// @version      5.0.0
+// @description  采集 Ozon.ru 类目树（L1→L2→L3→L4），模拟悬停展开子类目，导出 CSV/Excel/Markdown，面板自动保活
 // @author       Qin Yucheng
 // @match        https://www.ozon.ru/*
 // @match        https://ozon.ru/*
+// @grant        GM_addStyle
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_deleteValue
-// @grant        GM_listValues
-// @grant        GM_addStyle
-// @grant        GM_xmlhttpRequest
 // @connect      ozon.ru
 // @connect      www.ozon.ru
 // @license      MIT
@@ -27,13 +25,16 @@
     // ============================================================
     // Config
     // ============================================================
-    const BASE = 'https://www.ozon.ru';
+    var BASE = 'https://www.ozon.ru';
+    var HOVER_DELAY = 1000;   // 悬停后等待展开的时间(ms)
+    var SCROLL_DELAY = 500;   // 滚动后的等待时间(ms)
 
     // ============================================================
     // Utilities
     // ============================================================
     function safeText(el) {
-        return el ? (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim() : '';
+        if (!el) return '';
+        return (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
     }
 
     function buildUrl(path) {
@@ -46,127 +47,64 @@
         return Date.now().toString(36) + Math.random().toString(36).substr(2, 8);
     }
 
-    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+    function sleep(ms) {
+        return new Promise(function (resolve) {
+            setTimeout(resolve, ms);
+        });
+    }
+
+    // 模拟鼠标悬停，触发 Ozon 的展开菜单
+    function simulateHover(el) {
+        if (!el) return;
+        var events = ['mouseenter', 'mouseover', 'mousemove'];
+        for (var i = 0; i < events.length; i++) {
+            var ev = new MouseEvent(events[i], {
+                bubbles: true,
+                cancelable: true,
+                view: window
+            });
+            el.dispatchEvent(ev);
+        }
+    }
 
     // ============================================================
-    // DOM Context Helpers
+    // 判断元素是否在页面顶部/底部导航区内
     // ============================================================
-
-    // Check if element is in header/footer/sidebar
-    function isChrome(el) {
-        const chromeSelectors = [
+    function isNavChrome(el) {
+        if (!el) return true;
+        var selectors = [
             'header', 'footer', 'nav',
             '[class*="header"]', '[class*="footer"]',
             '[class*="sidebar"]', '[class*="nav-"]',
+            '[class*="user"]', '[class*="auth"]',
             '[data-widget="header"]', '[data-widget="footer"]',
-            '#__next > div:first-child', // Next.js default wrapper
+            '#__next > div:first-child'
         ];
-        for (const sel of chromeSelectors) {
+        for (var i = 0; i < selectors.length; i++) {
             try {
-                if (sel.startsWith('#') && el.id === sel.slice(1)) return true;
-                if (el.closest(sel)) return true;
+                if (el.closest(selectors[i])) return true;
             } catch (e) { /* ignore */ }
         }
+        // 也在可视区域顶部 150px 内的元素排除（通常是顶部导航）
+        try {
+            var rect = el.getBoundingClientRect();
+            if (rect.top < 150) return true;
+        } catch (e) { /* ignore */ }
         return false;
     }
 
-    // Find the nearest ancestor heading element (h1-h6) or heading-like div
-    function findNearestHeading(el) {
-        // Walk up DOM looking for h1-h6
-        let current = el.parentElement;
-        let found = null;
-        while (current && current !== document.body) {
-            // Check h1-h6
-            const h = current.querySelector('h1, h2, h3, h4, h5, h6');
-            if (h) {
-                // Verify the heading is ABOVE this element in the DOM, not inside it
-                const pos = h.compareDocumentPosition(el);
-                if (pos & Node.DOCUMENT_POSITION_FOLLOWING) {
-                    found = h;
-                    // Keep walking up to find a higher-level heading
-                }
-            }
-            current = current.parentElement;
-        }
-        return found;
-    }
-
-    // Find the nearest previous heading (sibling or ancestor's previous sibling)
-    function findPreviousHeading(el) {
-        // Walk backwards through siblings, then up
-        let node = el.previousSibling;
-        while (node) {
-            if (node.nodeType === 1) {
-                const tag = node.tagName;
-                if (tag && /^H[1-6]$/.test(tag)) return node;
-                const inner = node.querySelector('h1, h2, h3, h4, h5, h6');
-                if (inner) return inner;
-            }
-            node = node.previousSibling;
-        }
-        // If no previous sibling heading, check parent
-        if (el.parentElement) {
-            return findPreviousHeading(el.parentElement) || findNearestHeading(el);
-        }
-        return null;
-    }
-
-    // Find all preceding text that looks like a section title before this element
-    function findSectionTitle(el) {
-        // Strategy: look at the parent container, find text elements before this one
-        const parent = el.closest('section, article, div[class*="grid"], div[class*="categ"], div[class*="list"]') || el.parentElement;
-        if (!parent) return '';
-
-        const children = Array.from(parent.children);
-        const idx = children.indexOf(el.closest('div, a, li') || el);
-        if (idx <= 0) return '';
-
-        // Look backwards for heading-like elements
-        for (let i = idx - 1; i >= 0; i--) {
-            const child = children[i];
-            const tag = child.tagName;
-            if (tag && /^H[1-6]$/.test(tag)) return safeText(child);
-            // Check for div that looks like heading (bold, larger font, title class)
-            const txt = safeText(child);
-            if (txt && txt.length > 1 && txt.length < 80) {
-                const style = window.getComputedStyle(child);
-                const fw = parseInt(style.fontWeight) || 400;
-                const fs = parseFloat(style.fontSize) || 14;
-                const isHeadingLike = (
-                    fw >= 600 || fs >= 16 ||
-                    /title|heading|header|caption/i.test(child.className || '')
-                );
-                if (isHeadingLike && !child.querySelector('a')) return txt;
-            }
-        }
-        return '';
-    }
-
     // ============================================================
-    // Category Detection: is this link a category (not a product)?
+    // 判断一个链接是否是"类目链接"（而不是商品/订单等）
     // ============================================================
-    function isCategoryLink(link) {
-        const href = (link.getAttribute('href') || '').toLowerCase();
-        const text = safeText(link).toLowerCase();
+    function isCategoryLink(el) {
+        var href = (el.getAttribute('href') || '').toLowerCase();
+        var text = safeText(el).toLowerCase();
 
-        // Must have content
         if (!text || text.length < 2) return false;
-        if (text.length > 100) return false; // Too long = product name
+        if (text.length > 120) return false;
 
-        // Product pages: /product/xxx/
+        // 明确排除
         if (/\/product\//.test(href)) return false;
-
-        // Category pages
-        if (/\/category\//.test(href)) return true;
-
-        // Catalog/collection pages
-        if (/\/(catalog|collection|tag|brand)\//.test(href)) return true;
-
-        // Search/category filter pages (Ozon often links to search with category filter)
-        if (/\/search\/.*category/.test(href)) return true;
-        if (/\/category/.test(href)) return true;
-
-        // Non-category stuff
         if (/\/seller\//.test(href)) return false;
         if (/\/my\//.test(href)) return false;
         if (/\/cart\//.test(href)) return false;
@@ -175,328 +113,354 @@
         if (href === '/' || href === '') return false;
         if (/^https?:\/\//.test(href) && !/ozon\.ru/.test(href)) return false;
 
-        // For pages with category-like URL structure but no /category/ prefix
-        // e.g., /electronika/ or /bytovaya-tehnika/
-        if (href.match(/^\/[a-zа-яё-]+\/\d*\/?$/) || href.match(/^\/[a-zа-яё-]+-[a-zа-яё-]+\/\d*\/?$/)) {
-            return true;
-        }
+        // 明确包含 /category/ 的一定是类目
+        if (/\/category\//.test(href)) return true;
+
+        // 形如 /electronics/ 或 /krupnaya-bytovaya-tekhnika-10500/ 的 URL
+        if (/^\/[a-zа-яё0-9\-]+\/?$/.test(href)) return true;
+        if (/^\/[a-zа-яё0-9\-]+\/\d*\/?$/.test(href)) return true;
 
         return false;
     }
 
     // ============================================================
-    // Scraping Engine: Hierarchical Category Extraction
+    // 核心：采集当前页面的类目树
     // ============================================================
-    function scrapeAllCategories() {
-        const L1 = getL1Category();
-        const allLinks = Array.from(document.querySelectorAll('a'));
+    async function scrapeCategories() {
+        var now = new Date().toISOString();
+        var items = [];
+        var seen = {};
 
-        // Filter: category links in main content area
-        const catLinks = allLinks.filter(link => {
-            if (isChrome(link)) return false;
-            return isCategoryLink(link);
-        });
-
-        console.log('[OzonCat] Raw category links found:', catLinks.length);
-
-        // ============================================================
-        // Strategy 1: Find tab/button bar for L2
-        // ============================================================
-        let l2Items = [];
-        const tabBarCandidate = findTabBar();
-        if (tabBarCandidate) {
-            const tabs = tabBarCandidate.querySelectorAll('a, button, [role="tab"], [role="button"]');
-            for (const tab of tabs) {
-                const text = safeText(tab);
-                if (text && text.length >= 2 && text.length < 60) {
-                    const href = tab.getAttribute('href') || tab.closest('a')?.getAttribute('href') || '';
-                    l2Items.push({ name: text, url: href, level: 2 });
-                }
-            }
+        // Step 1: 获取 L1（当前页面标题/面包屑）
+        var l1Name = getPageCategory();
+        if (l1Name) {
+            items.push({
+                id: generateId(),
+                name: l1Name,
+                level: 1,
+                parent: '',
+                url: location.pathname,
+                emoji: '📁',
+                scrapedAt: now
+            });
+            seen[l1Name] = true;
         }
 
-        // Strategy 2: If no tab bar, use URL structure to find L2
-        if (l2Items.length === 0) {
-            // Top-level category links (direct children of main content)
-            l2Items = catLinks
-                .filter(l => {
-                    const href = l.getAttribute('href') || '';
-                    return /\/category\//.test(href) && !/\/category\/[^/]+\//.test(href.replace(/\/$/, ''));
-                })
-                .map(l => ({ name: safeText(l), url: l.getAttribute('href') || '', level: 2 }))
-                .slice(0, 20);
+        // Step 2: 找到页面上所有"类目链接"元素
+        var allLinks = document.querySelectorAll('a');
+        var catEls = [];
+        for (var i = 0; i < allLinks.length; i++) {
+            var el = allLinks[i];
+            if (isNavChrome(el)) continue;
+            if (!isCategoryLink(el)) continue;
+            catEls.push(el);
         }
 
-        // Deduplicate L2
-        const seen2 = new Set();
-        l2Items = l2Items.filter(item => {
-            const key = item.name.trim();
-            if (seen2.has(key)) return false;
-            seen2.add(key);
-            return true;
-        });
+        console.log('[OzonCat] 找到类目链接:', catEls.length);
 
-        // ============================================================
-        // Strategy 3: Find sections with headings (L3) and their children (L4)
-        // ============================================================
-        // Group remaining links by their section context
-        const sections = [];
+        // Step 3: 对可能是"带子类目"的元素模拟悬停
+        // Ozon 的做法：鼠标悬停在左侧类目上 → 右侧展开子类目
+        var hoverTargets = findHoverTargets(catEls);
 
-        // Find all heading-like elements in the main content
-        const headings = findAllHeadings();
-
-        for (const h of headings) {
-            const title = safeText(h);
-            if (!title || title.length < 2 || title.length > 80) continue;
-            if (/купить|корзина|избран|цена|скидк|фильтр|сортир|показать|страниц/i.test(title)) continue;
-
-            // Find links that belong to this section
-            const sectionLinks = [];
-            let current = h.nextElementSibling;
-            let safety = 0;
-
-            while (current && safety < 200) {
-                safety++;
-                // Stop at next heading
-                if (current.tagName && /^H[1-4]$/.test(current.tagName)) break;
-
-                // Collect links
-                const links = current.querySelectorAll('a');
-                for (const l of links) {
-                    if (isChrome(l)) continue;
-                    if (!isCategoryLink(l) && !/\/product\//.test(l.getAttribute('href') || '')) continue;
-                    const text = safeText(l);
-                    if (text && text.length >= 2 && text.length < 120) {
-                        const href = l.getAttribute('href') || '';
-                        sectionLinks.push({ name: text, url: href });
-                    }
-                }
-
-                current = current.nextElementSibling;
+        if (hoverTargets.length > 0) {
+            addLog('🖱 发现 ' + hoverTargets.length + ' 个可悬停类目，开始模拟悬停...');
+            for (var h = 0; h < hoverTargets.length; h++) {
+                var target = hoverTargets[h];
+                addLog('  悬停: ' + safeText(target.el).substring(0, 30));
+                simulateHover(target.el);
+                // 等待展开
+                await sleep(HOVER_DELAY);
+                // 有时需要滚动到元素位置才能触发
+                try { target.el.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch (e) {}
+                simulateHover(target.el);
+                await sleep(SCROLL_DELAY);
             }
-
-            if (sectionLinks.length > 0) {
-                sections.push({ title, links: sectionLinks });
+            addLog('✅ 悬停完成，重新扫描页面...');
+            // 重新获取链接（现在有了展开的内容）
+            allLinks = document.querySelectorAll('a');
+            catEls = [];
+            for (var i2 = 0; i2 < allLinks.length; i2++) {
+                var el2 = allLinks[i2];
+                if (isNavChrome(el2)) continue;
+                if (!isCategoryLink(el2)) continue;
+                catEls.push(el2);
             }
+            console.log('[OzonCat] 悬停后重新扫描，找到:', catEls.length);
         }
 
-        // ============================================================
-        // Strategy 4: DOM position-based grouping (fallback)
-        // ============================================================
-        if (sections.length === 0) {
-            // Group by parent container
-            const groups = new Map();
-            for (const link of catLinks) {
-                // Find the section container
-                const section = link.closest(
-                    'section, article, [class*="group"], [class*="block"], [class*="row"], [class*="col"]'
-                ) || link.parentElement;
-                if (!section) continue;
+        // Step 4: 对所有类目链接分层级
+        var result = assignLevels(catEls, l1Name);
 
-                const sectionKey = section.className || section.tagName;
-                if (!groups.has(sectionKey)) groups.set(sectionKey, []);
-                groups.get(sectionKey).push({ name: safeText(link), url: link.getAttribute('href') || '' });
-            }
-
-            for (const [key, links] of groups) {
-                if (links.length >= 2) {
-                    // Find title for this group
-                    let title = '';
-                    const container = document.querySelector('.' + key.split(' ')[0]) ||
-                                    document.querySelector(key);
-                    if (container) {
-                        const h = container.querySelector('h2, h3, h4, h5');
-                        if (h) title = safeText(h);
-                    }
-                    if (!title) {
-                        // Use first link parent's section context
-                        title = findSectionTitle(links[0].el);
-                    }
-                    if (title && links.length > 0) {
-                        sections.push({ title, links });
-                    }
-                }
-            }
+        // 合并到 items
+        for (var j = 0; j < result.length; j++) {
+            var r = result[j];
+            if (seen[r.name + '|' + r.level]) continue;
+            seen[r.name + '|' + r.level] = true;
+            items.push({
+                id: generateId(),
+                name: r.name,
+                level: r.level,
+                parent: r.parent || '',
+                url: r.url || '',
+                emoji: ['', '', '📂', '📋', '📄'][r.level] || '📄',
+                scrapedAt: now
+            });
         }
 
-        // Deduplicate L3 sections by title
-        const seen3 = new Set();
-        const dedupedSections = sections.filter(s => {
-            const key = s.title.trim();
-            if (seen3.has(key)) return false;
-            seen3.add(key);
-            return s.links.length > 0;
-        });
-
-        return {
-            l1: L1,
-            l2: l2Items,
-            l3and4: dedupedSections,
-            rawCount: catLinks.length,
-        };
+        return items;
     }
 
-    function getL1Category() {
-        const path = location.pathname;
-
-        // Breadcrumb approach
-        const breadLinks = document.querySelectorAll(
-            'a[href*="/category/"], [class*="bread"] a, [data-widget*="bread"] a, nav[aria-label] a'
-        );
-        const crumbs = [];
-        for (const b of breadLinks) {
-            const t = safeText(b);
-            if (t && t.length > 1 && t.length < 80) crumbs.push(t);
-        }
-
+    // 获取当前页面的类目标题（L1）
+    function getPageCategory() {
+        // 方法1：面包屑最后一个
+        var crumbs = document.querySelectorAll('[class*="bread"] a, nav[aria-label] a, [data-widget*="bread"] a');
         if (crumbs.length > 0) {
-            // The deepest breadcrumb that's not the current page
-            return crumbs[crumbs.length - 1];
+            var lastCrumb = crumbs[crumbs.length - 1];
+            var t = safeText(lastCrumb);
+            if (t && t.length > 1 && t.length < 80) return t;
         }
 
-        // URL approach
-        if (/\/category\//.test(path)) {
-            const m = path.match(/\/category\/([^/]+)/);
-            if (m) {
-                return m[1].replace(/-/g, ' ').replace(/\d+/g, '').trim();
-            }
+        // 方法2：h1
+        var h1 = document.querySelector('h1');
+        if (h1) { var t2 = safeText(h1); if (t2) return t2; }
+
+        // 方法3：URL 中的 slug
+        var m = location.pathname.match(/\/([a-z0-9\-]+)-(\d+)\/?$/);
+        if (m) {
+            return m[1].replace(/-/g, ' ').replace(/\d+/g, '').trim();
         }
 
-        // Page title fallback
-        const h1 = document.querySelector('h1');
-        if (h1) return safeText(h1);
-
-        return 'Все категории';
+        return '';
     }
 
-    function findTabBar() {
-        // Look for horizontal scrollable container with category links
-        const candidates = document.querySelectorAll(
-            '[class*="tabs"], [class*="tab"], [class*="catalogNav"], [class*="catNav"], ' +
-            '[class*="subcat"], [class*="submenu"], [class*="pill"], [class*="chip"], ' +
-            '[class*="scroll"]'
-        );
+    // 找出需要"悬停"才能展开子类目的元素
+    function findHoverTargets(catEls) {
+        var targets = [];
+        var seen = {};
 
-        for (const c of candidates) {
-            const style = window.getComputedStyle(c);
-            const links = c.querySelectorAll('a');
-            // Must have multiple links and be a horizontal container
-            if (links.length >= 3 && (style.display === 'flex' || style.overflowX === 'auto' || style.overflowX === 'scroll')) {
-                // Verify links point to categories
-                let catCount = 0;
-                for (const l of links) {
-                    if (isCategoryLink(l) || /\/category\//.test(l.getAttribute('href') || '')) catCount++;
+        for (var i = 0; i < catEls.length; i++) {
+            var el = catEls[i];
+            var text = safeText(el);
+            if (!text || text.length < 2 || text.length > 60) continue;
+
+            // 找父级容器（可能是悬停目标）
+            var parent = el.closest('li, [role="menuitem"], [class*="item"], [class*="row"]');
+            if (!parent) parent = el.parentElement;
+
+            // 判断这个元素"可能有子类目"：
+            //   - 它内部没有 /product/ 链接
+            //   - 或者它有一个箭头/展开图标
+            var hasProductLink = parent ? parent.querySelector('a[href*="/product/"]') : null;
+            var hasArrow = parent ? (parent.querySelector('[class*="arrow"], [class*="chevron"], svg') || el.querySelector('[class*="arrow"], svg')) : null;
+
+            if (!hasProductLink || hasArrow) {
+                var key = text.substring(0, 40);
+                if (!seen[key]) {
+                    seen[key] = true;
+                    targets.push({ el: parent || el, text: text });
                 }
-                if (catCount >= 2) return c;
+            }
+
+            // 最多处理 15 个悬停目标（避免太慢）
+            if (targets.length >= 15) break;
+        }
+
+        return targets;
+    }
+
+    // 对所有类目链接判断层级
+    function assignLevels(catEls, l1Name) {
+        var result = [];
+        var l2Set = {};
+        var l3Map = {};
+
+        // 先找"主类目区块"——通常在页面中间，字体较大
+        // 策略：通过 getComputedStyle 判断 font-size / font-weight
+        var l2Candidates = [];
+
+        for (var i = 0; i < catEls.length; i++) {
+            var el = catEls[i];
+            var text = safeText(el);
+            if (!text || text.length < 2) continue;
+
+            // 跳过 L1 自身
+            if (l1Name && text === l1Name) continue;
+
+            var style = null;
+            try { style = window.getComputedStyle(el); } catch (e) { style = null; }
+
+            var fontSize = style ? parseFloat(style.fontSize) : 14;
+            var fontWeight = style ? parseInt(style.fontWeight) || 400 : 400;
+
+            // L2 特征：字体较大(>=15px) 或 字体较粗(>=600)
+            if (fontSize >= 15 || fontWeight >= 600) {
+                if (!l2Set[text]) {
+                    l2Set[text] = true;
+                    l2Candidates.push({ name: text, url: el.getAttribute('href') || '', el: el });
+                }
             }
         }
 
-        // Fallback: find any flex container with category links
-        const flexContainers = document.querySelectorAll('[style*="display: flex"], [style*="display:flex"]');
-        for (const c of flexContainers) {
-            const links = c.querySelectorAll('a[href*="/category/"]');
-            if (links.length >= 3) return c;
+        // 如果没有通过样式找到 L2，就用 URL 深度判断
+        if (l2Candidates.length === 0) {
+            for (var i2 = 0; i2 < catEls.length; i2++) {
+                var el2 = catEls[i2];
+                var href2 = el2.getAttribute('href') || '';
+                var text2 = safeText(el2);
+                if (!text2 || text2.length < 2) continue;
+                if (l1Name && text2 === l1Name) continue;
+                // /category/xxx/ 是 L2
+                if (/\/category\/[^/]+\/?$/.test(href2)) {
+                    if (!l2Set[text2]) {
+                        l2Set[text2] = true;
+                        l2Candidates.push({ name: text2, url: href2, el: el2 });
+                    }
+                }
+            }
         }
 
-        return null;
-    }
+        // 现在找 L3/L4：在 L2 元素"附近"的链接
+        for (var j = 0; j < l2Candidates.length; j++) {
+            var l2 = l2Candidates[j];
+            result.push({ name: l2.name, level: 2, parent: l1Name || '', url: l2.url });
 
-    function findAllHeadings() {
-        // Find all h1-h6 elements in main content (excluding chrome)
-        const hs = document.querySelectorAll('h1, h2, h3, h4, h5, h6');
-        const result = [];
-        for (const h of hs) {
-            if (!isChrome(h)) result.push(h);
+            // 找这个 L2 元素之后的兄弟元素中的链接 → L3
+            var l3Items = findSiblingLinks(l2.el, 3);
+            for (var k = 0; k < l3Items.length; k++) {
+                var l3 = l3Items[k];
+                if (!l3Map[l2.name]) l3Map[l2.name] = [];
+                l3Map[l2.name].push(l3);
+
+                result.push({ name: l3.name, level: 3, parent: l2.name, url: l3.url });
+
+                // L3 下方可能还有 L4
+                // 找 L3 元素附近的链接
+                var l4Items = findSiblingLinks(l3.el, 4);
+                for (var m = 0; m < l4Items.length; m++) {
+                    result.push({ name: l4Items[m].name, level: 4, parent: l3.name, url: l4Items[m].url });
+                }
+            }
         }
 
-        // If no headings found, look for heading-like divs
+        // 如果以上都没找到，就把所有类目链接作为 L2 返回
         if (result.length === 0) {
-            const headingLike = document.querySelectorAll(
-                '[class*="title"], [class*="heading"], [class*="header"], ' +
-                '[class*="section-name"], [class*="group-title"]'
-            );
-            for (const h of headingLike) {
-                if (!isChrome(h) && !h.querySelector('a[href]')) result.push(h);
+            for (var n = 0; n < catEls.length; n++) {
+                var text3 = safeText(catEls[n]);
+                var href3 = catEls[n].getAttribute('href') || '';
+                if (!text3 || text3.length < 2) continue;
+                if (l1Name && text3 === l1Name) continue;
+                result.push({ name: text3, level: 2, parent: l1Name || '', url: href3 });
             }
         }
 
         return result;
     }
 
+    // 找一个元素"后面"的兄弟元素中的链接（用于发现 L3/L4）
+    function findSiblingLinks(el, maxDepth) {
+        var results = [];
+        var seen = {};
+        var current = el ? el.parentElement : null;
+        if (!current) return results;
+
+        // 向上找容器，然后找容器内所有链接
+        var container = el.closest('li, div[class*="item"], div[class*="col"], div[class*="cell"]') || current;
+
+        var links = container.querySelectorAll('a');
+        for (var i = 0; i < links.length; i++) {
+            var link = links[i];
+            if (link === el) continue;
+            if (isNavChrome(link)) continue;
+            var text = safeText(link);
+            if (!text || text.length < 2 || text.length > 100) continue;
+            if (seen[text]) continue;
+            seen[text] = true;
+            results.push({ name: text, url: link.getAttribute('href') || '', el: link });
+        }
+
+        return results.slice(0, 30);
+    }
+
     // ============================================================
-    // IndexedDB Storage
+    // IndexedDB 存储
     // ============================================================
-    const DB_NAME = 'OzonCatTreeV4';
-    const STORE_NAME = 'categories';
-    let dbInstance = null;
+    var DB_NAME = 'OzonCatTreeV5';
+    var STORE_NAME = 'categories';
+    var dbInstance = null;
 
     function initDB() {
         if (dbInstance) return Promise.resolve(dbInstance);
-        return new Promise((resolve, reject) => {
-            const req = indexedDB.open(DB_NAME, 1);
-            req.onupgradeneeded = (e) => {
-                const db = e.target.result;
+        return new Promise(function (resolve, reject) {
+            var req = indexedDB.open(DB_NAME, 1);
+            req.onupgradeneeded = function (e) {
+                var db = e.target.result;
                 if (!db.objectStoreNames.contains(STORE_NAME)) {
                     db.createObjectStore(STORE_NAME, { keyPath: 'id' });
                 }
             };
-            req.onsuccess = (e) => { dbInstance = e.target.result; resolve(dbInstance); };
-            req.onerror = (e) => reject(e.target.error);
+            req.onsuccess = function (e) {
+                dbInstance = e.target.result;
+                resolve(dbInstance);
+            };
+            req.onerror = function (e) { reject(e.target.error); };
         });
     }
 
-    // Save a batch of categories (replace all for current level)
-    async function saveBatch(items) {
-        const db = await initDB();
-        return new Promise((resolve, reject) => {
-            const tx = db.transaction(STORE_NAME, 'readwrite');
-            const store = tx.objectStore(STORE_NAME);
-            for (const item of items) {
-                store.put(item);
-            }
-            tx.oncomplete = () => resolve();
-            tx.onerror = (e) => reject(e.target.error);
+    function saveItems(items) {
+        return initDB().then(function (db) {
+            return new Promise(function (resolve, reject) {
+                var tx = db.transaction(STORE_NAME, 'readwrite');
+                var store = tx.objectStore(STORE_NAME);
+                for (var i = 0; i < items.length; i++) {
+                    store.put(items[i]);
+                }
+                tx.oncomplete = function () { resolve(); };
+                tx.onerror = function (e) { reject(e.target.error); };
+            });
         });
     }
 
-    async function getAll() {
-        const db = await initDB();
-        return new Promise((resolve) => {
-            const tx = db.transaction(STORE_NAME, 'readonly');
-            const store = tx.objectStore(STORE_NAME);
-            const req = store.getAll();
-            req.onsuccess = () => resolve(req.result || []);
+    function getAllItems() {
+        return initDB().then(function (db) {
+            return new Promise(function (resolve) {
+                var tx = db.transaction(STORE_NAME, 'readonly');
+                var store = tx.objectStore(STORE_NAME);
+                var req = store.getAll();
+                req.onsuccess = function () { resolve(req.result || []); };
+                req.onerror = function () { resolve([]); };
+            });
         });
     }
 
-    async function clearAll() {
-        const db = await initDB();
-        return new Promise((resolve) => {
-            const tx = db.transaction(STORE_NAME, 'readwrite');
-            const store = tx.objectStore(STORE_NAME);
-            store.clear();
-            tx.oncomplete = () => resolve();
+    function clearAll() {
+        return initDB().then(function (db) {
+            return new Promise(function (resolve) {
+                var tx = db.transaction(STORE_NAME, 'readwrite');
+                var store = tx.objectStore(STORE_NAME);
+                store.clear();
+                tx.oncomplete = function () { resolve(); };
+            });
         });
     }
 
     // ============================================================
-    // SheetJS Dynamic Loader
+    // SheetJS 动态加载
     // ============================================================
     function loadSheetJS() {
-        const urls = [
+        var urls = [
             'https://cdn.bootcdn.net/ajax/libs/xlsx/0.20.3/xlsx.full.min.js',
             'https://unpkg.com/xlsx@0.20.3/dist/xlsx.full.min.js',
-            'https://cdn.jsdelivr.net/npm/xlsx@0.20.3/dist/xlsx.full.min.js',
+            'https://cdn.jsdelivr.net/npm/xlsx@0.20.3/dist/xlsx.full.min.js'
         ];
-        return new Promise((resolve) => {
+        return new Promise(function (resolve) {
             if (typeof XLSX !== 'undefined') { resolve(true); return; }
-            let idx = 0;
+            var idx = 0;
             function tryNext() {
                 if (idx >= urls.length) { resolve(false); return; }
-                const s = document.createElement('script');
+                var s = document.createElement('script');
                 s.src = urls[idx];
-                s.onload = () => resolve(true);
-                s.onerror = () => { idx++; tryNext(); };
+                s.onload = function () { resolve(true); };
+                s.onerror = function () { idx++; tryNext(); };
                 document.head.appendChild(s);
             }
             tryNext();
@@ -504,60 +468,59 @@
     }
 
     function downloadBlob(content, filename, mime) {
-        const blob = content instanceof Blob ? content : new Blob([content], { type: mime || 'text/plain' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
+        var blob = content instanceof Blob ? content : new Blob([content], { type: mime || 'text/plain' });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
         a.href = url; a.download = filename; a.style.display = 'none';
         document.body.appendChild(a);
         a.click();
-        setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 1000);
+        setTimeout(function () { URL.revokeObjectURL(url); a.remove(); }, 1000);
     }
 
     // ============================================================
-    // Export: Markdown
+    // 导出：Markdown
     // ============================================================
     async function exportMarkdown() {
-        const all = await getAll();
+        var all = await getAllItems();
         if (all.length === 0) {
             alert('没有数据！请先在类目页点击"采集本页"。');
             return;
         }
 
-        // Group by level
-        const l1Items = all.filter(c => c.level === 1);
-        const l2Items = all.filter(c => c.level === 2);
-        const l3Items = all.filter(c => c.level === 3);
-        const l4Items = all.filter(c => c.level === 4);
+        var l1Items = all.filter(function (c) { return c.level === 1; });
+        var l2Items = all.filter(function (c) { return c.level === 2; });
+        var l3Items = all.filter(function (c) { return c.level === 3; });
+        var l4Items = all.filter(function (c) { return c.level === 4; });
 
-        let md = '# Ozon 类目树\n\n';
+        var md = '# Ozon 类目树\n\n';
         md += '> 采集时间: ' + new Date().toISOString() + '\n';
         md += '> 来源: ' + location.origin + '\n';
         md += '> 总计: ' + all.length + ' 条类目\n\n';
         md += '---\n\n';
 
-        // L1 → L2 → L3 → L4 hierarchy
         if (l1Items.length > 0) {
-            for (const l1 of l1Items) {
+            for (var i = 0; i < l1Items.length; i++) {
+                var l1 = l1Items[i];
                 md += '## ' + (l1.emoji || '📁') + ' ' + l1.name + '\n\n';
-                md += l1.url ? '> ' + buildUrl(l1.url) + '\n\n' : '\n';
+                if (l1.url) md += '> ' + buildUrl(l1.url) + '\n\n';
 
-                // Find L2 items under this L1
-                const children2 = l2Items.filter(c => c.parent === l1.name);
-                for (const l2 of children2) {
+                var children2 = l2Items.filter(function (c) { return c.parent === l1.name; });
+                for (var j = 0; j < children2.length; j++) {
+                    var l2 = children2[j];
                     md += '### ' + (l2.emoji || '📂') + ' ' + l2.name + '\n\n';
-                    md += l2.url ? '> ' + buildUrl(l2.url) + '\n\n' : '\n';
+                    if (l2.url) md += '> ' + buildUrl(l2.url) + '\n\n';
 
-                    // Find L3 items under this L2
-                    const children3 = l3Items.filter(c => c.parent === l2.name);
-                    for (const l3 of children3) {
+                    var children3 = l3Items.filter(function (c) { return c.parent === l2.name; });
+                    for (var k = 0; k < children3.length; k++) {
+                        var l3 = children3[k];
                         md += '#### ' + (l3.emoji || '📋') + ' ' + l3.name + '\n\n';
-                        md += l3.url ? '> ' + buildUrl(l3.url) + '\n\n' : '\n';
+                        if (l3.url) md += '> ' + buildUrl(l3.url) + '\n\n';
 
-                        // Find L4 items under this L3
-                        const children4 = l4Items.filter(c => c.parent === l3.name);
-                        for (const l4 of children4) {
+                        var children4 = l4Items.filter(function (c) { return c.parent === l3.name; });
+                        for (var m = 0; m < children4.length; m++) {
+                            var l4 = children4[m];
                             md += '- **' + l4.name + '**';
-                            md += l4.url ? ' — [' + buildUrl(l4.url) + '](' + buildUrl(l4.url) + ')' : '';
+                            if (l4.url) md += ' — [' + buildUrl(l4.url) + '](' + buildUrl(l4.url) + ')';
                             md += '\n';
                         }
                         md += '\n';
@@ -565,13 +528,13 @@
                 }
             }
         } else {
-            // Flat export with level indicators
             md += '## 📊 按层级分类\n\n';
-            for (let lv = 1; lv <= 4; lv++) {
-                const items = all.filter(c => c.level === lv);
+            for (var lv = 1; lv <= 4; lv++) {
+                var items = all.filter(function (c) { return c.level === lv; });
                 if (items.length === 0) continue;
                 md += '### ' + ['', '一级类目', '二级类目', '三级类目', '四级类目'][lv] + ' (' + items.length + '个)\n\n';
-                for (const item of items) {
+                for (var n = 0; n < items.length; n++) {
+                    var item = items[n];
                     md += '- **' + item.name + '**';
                     if (item.parent) md += ' ← ' + item.parent;
                     if (item.url) md += ' [' + buildUrl(item.url) + '](' + buildUrl(item.url) + ')';
@@ -581,7 +544,6 @@
             }
         }
 
-        // Stats footer
         md += '---\n\n';
         md += '## 📈 统计\n\n';
         md += '| 层级 | 数量 |\n| --- | --- |\n';
@@ -596,187 +558,193 @@
     }
 
     // ============================================================
-    // Export: CSV
+    // 导出：CSV
     // ============================================================
     async function exportCSV() {
-        const all = await getAll();
+        var all = await getAllItems();
         if (all.length === 0) {
             alert('没有数据！请先在类目页点击"采集本页"。');
             return;
         }
-        const BOM = '\uFEFF';
-        const h = ['层级','类目名','完整路径','父类目','URL','采集时间'];
-        const rows = all.map(c => {
-            const path = c.path || c.name;
+        var BOM = '\uFEFF';
+        var header = ['层级', '类目名', '完整路径', '父类目', 'URL', '采集时间'];
+        var rows = all.map(function (c) {
+            var path = c.path || c.name;
             return [
                 c.level || '',
                 '"' + (c.name || '').replace(/"/g, '""') + '"',
                 '"' + (path || '').replace(/"/g, '""') + '"',
                 '"' + (c.parent || '').replace(/"/g, '""') + '"',
                 c.url ? buildUrl(c.url) : '',
-                c.scrapedAt || '',
+                c.scrapedAt || ''
             ].join(',');
         });
-        downloadBlob(BOM + h.join(',') + '\n' + rows.join('\n'), 'ozon-categories-' + Date.now() + '.csv', 'text/csv;charset=utf-8');
+        downloadBlob(BOM + header.join(',') + '\n' + rows.join('\n'), 'ozon-categories-' + Date.now() + '.csv', 'text/csv;charset=utf-8');
         showMsg('CSV 导出完成！共 ' + all.length + ' 条', 'ok');
     }
 
+    // ============================================================
+    // 导出：Excel
+    // ============================================================
     async function exportExcel() {
-        const all = await getAll();
+        var all = await getAllItems();
         if (all.length === 0) {
             alert('没有数据！请先在类目页点击"采集本页"。');
             return;
         }
         if (typeof XLSX === 'undefined') {
             showMsg('加载 Excel 库...', 'info');
-            const ok = await loadSheetJS();
+            var ok = await loadSheetJS();
             if (!ok) { showMsg('Excel 库加载失败，请用 CSV', 'err'); return; }
         }
-        const data = all.map(c => ({
-            '层级': c.level || '',
-            '类目名': c.name || '',
-            '完整路径': c.path || c.name,
-            '父类目': c.parent || '',
-            'URL': c.url ? buildUrl(c.url) : '',
-            '采集时间': c.scrapedAt || '',
-        }));
-        const ws = XLSX.utils.json_to_sheet(data);
-        ws['!cols'] = [{wch:6},{wch:35},{wch:50},{wch:30},{wch:60},{wch:22}];
-        const wb = XLSX.utils.book_new();
+        var data = all.map(function (c) {
+            return {
+                '层级': c.level || '',
+                '类目名': c.name || '',
+                '完整路径': c.path || c.name,
+                '父类目': c.parent || '',
+                'URL': c.url ? buildUrl(c.url) : '',
+                '采集时间': c.scrapedAt || ''
+            };
+        });
+        var ws = XLSX.utils.json_to_sheet(data);
+        ws['!cols'] = [{ wch: 6 }, { wch: 35 }, { wch: 50 }, { wch: 30 }, { wch: 60 }, { wch: 22 }];
+        var wb = XLSX.utils.book_new();
         XLSX.utils.book_append_sheet(wb, ws, 'Ozon类目');
-        const buf = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+        var buf = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
         downloadBlob(new Blob([buf]), 'ozon-categories-' + Date.now() + '.xlsx');
         showMsg('Excel 导出完成！共 ' + all.length + ' 条', 'ok');
     }
 
     // ============================================================
-    // UI: Panel
+    // UI
     // ============================================================
-    const CSS = `
-#oz-scraper{position:fixed;top:10px;right:10px;z-index:2147483647;width:300px;background:#1a1a2e;color:#cdd6f4;border-radius:10px;box-shadow:0 4px 24px rgba(0,0,0,.6);font:12px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;border:1px solid #313244;user-select:none;}
-.oz-hd{display:flex;align-items:center;padding:7px 10px;background:#1e1e2e;border-radius:10px 10px 0 0;border-bottom:1px solid #313244;cursor:grab;gap:6px}
-.oz-hd:active{cursor:grabbing}
-.oz-lg{width:22px;height:22px;border-radius:5px;background:linear-gradient(135deg,#667eea,#cba6f7);display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0;color:#1a1a2e;font-weight:700}
-.oz-tt{flex:1;font-weight:700;font-size:12px;letter-spacing:.3px}
-.oz-cl{background:0;border:0;color:#585b70;cursor:pointer;font-size:15px;padding:0 3px;line-height:1}
-.oz-cl:hover{color:#f38ba8}
-.oz-bd{padding:10px;display:flex;flex-direction:column;gap:7px}
-.oz-st{display:flex;align-items:center;justify-content:space-between;padding:6px 8px;background:#181825;border-radius:6px;font-size:11px}
-.oz-nm{font-weight:700;color:#89b4fa;font-size:15px;min-width:20px;text-align:center}
-.oz-lb{font-size:8px;padding:2px 6px;border-radius:8px;text-transform:uppercase;letter-spacing:.5px}
-.oz-lb.idle{background:#313244;color:#6c7086}
-.oz-lb.run{background:#1a3a1a;color:#a6e3a1;animation:oz-p .8s infinite}
-@keyframes oz-p{0%,100%{opacity:1}50%{opacity:.5}}
-.oz-inf{font-size:10px;color:#6c7086;padding:3px 6px;background:#11111b;border-radius:4px;text-align:center;line-height:1.5}
-.oz-br{display:flex;gap:4px}
-.oz-bt{flex:1;padding:9px 6px;border:0;border-radius:7px;cursor:pointer;font-size:12px;font-weight:600;text-align:center;transition:transform .1s}
-.oz-bt:active{transform:scale(.96)}
-.oz-bt:disabled{opacity:.25;cursor:not-allowed}
-.oz-scan{background:#89b4fa;color:#1a1a2e}
-.oz-stop{background:#f38ba8;color:#1a1a2e}
-.oz-csv{background:#45475a;color:#cdd6f4;font-size:10px;padding:5px}
-.oz-xls{background:#a6e3a1;color:#1a1a2e;font-size:10px;padding:5px}
-.oz-md{background:#fab387;color:#1a1a2e;font-size:10px;padding:5px}
-.oz-clr{background:none;border:1px solid #45475a;color:#6c7086;font-size:9px;padding:5px 8px;border-radius:5px;cursor:pointer}
-.oz-clr:hover{color:#f38ba8;border-color:#f38ba8}
-.oz-log{max-height:140px;overflow-y:auto;font-size:9px;background:#11111b;border-radius:6px;padding:5px;color:#585b70;line-height:1.4;display:none;font-family:monospace}
-.oz-log.on{display:block}
-.oz-log i{padding:1px 0;border-bottom:1px solid #181825;display:block}
-.oz-msg{position:fixed;top:10px;left:50%;transform:translateX(-50%);padding:8px 18px;border-radius:8px;font-size:13px;z-index:2147483648;box-shadow:0 2px 12px rgba(0,0,0,.5);pointer-events:none;animation:oz-fd 2.5s ease forwards}
-.oz-msg.ok{background:#a6e3a1;color:#1a1a2e}
-.oz-msg.err{background:#f38ba8;color:#1a1a2e}
-.oz-msg.inf{background:#89b4fa;color:#1a1a2e}
-@keyframes oz-fd{0%{opacity:0;top:20px}15%{opacity:1;top:10px}80%{opacity:1;top:10px}100%{opacity:0;top:0}}
-#oz-scraper .oz-br2{display:flex;gap:4px;margin-top:0}
-`;
+    var CSS = '#oz-scraper{position:fixed;top:10px;right:10px;z-index:2147483647;width:310px;background:#1a1a2e;color:#cdd6f4;border-radius:10px;box-shadow:0 4px 24px rgba(0,0,0,0.6);font:12px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;border:1px solid #313244;user-select:none}.oz-hd{display:flex;align-items:center;padding:7px 10px;background:#1e1e2e;border-radius:10px 10px 0 0;border-bottom:1px solid #313244;cursor:grab;gap:6px}.oz-hd:active{cursor:grabbing}.oz-lg{width:22px;height:22px;border-radius:5px;background:linear-gradient(135deg,#667eea,#cba6f7);display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0;color:#1a1a2e;font-weight:700}.oz-tt{flex:1;font-weight:700;font-size:12px;letter-spacing:0.3px}.oz-cl{background:none;border:none;color:#585b70;cursor:pointer;font-size:15px;padding:0 3px;line-height:1}.oz-cl:hover{color:#f38ba8}.oz-bd{padding:10px;display:flex;flex-direction:column;gap:7px}.oz-st{display:flex;align-items:center;justify-content:space-between;padding:6px 8px;background:#181825;border-radius:6px;font-size:11px}.oz-nm{font-weight:700;color:#89b4fa;font-size:15px;min-width:20px;text-align:center}.oz-lb{font-size:8px;padding:2px 6px;border-radius:8px;text-transform:uppercase;letter-spacing:0.5px}.oz-lb.idle{background:#313244;color:#6c7086}.oz-lb.run{background:#1a3a1a;color:#a6e3a1;animation:oz-pulse 0.8s infinite}@keyframes oz-pulse{0%,100%{opacity:1}50%{opacity:0.5}}.oz-inf{font-size:10px;color:#6c7086;padding:3px 6px;background:#11111b;border-radius:4px;text-align:center;line-height:1.5}.oz-br{display:flex;gap:4px}.oz-bt{flex:1;padding:9px 6px;border:none;border-radius:7px;cursor:pointer;font-size:12px;font-weight:600;text-align:center;transition:transform 0.1s}.oz-bt:active{transform:scale(0.96)}.oz-bt:disabled{opacity:0.25;cursor:not-allowed}.oz-scan{background:#89b4fa;color:#1a1a2e}.oz-stop{background:#f38ba8;color:#1a1a2e}.oz-csv{background:#45475a;color:#cdd6f4;font-size:10px;padding:5px}.oz-xls{background:#a6e3a1;color:#1a1a2e;font-size:10px;padding:5px}.oz-md{background:#fab387;color:#1a1a2e;font-size:10px;padding:5px}.oz-clr{background:none;border:1px solid #45475a;color:#6c7086;font-size:9px;padding:5px 8px;border-radius:5px;cursor:pointer}.oz-clr:hover{color:#f38ba8;border-color:#f38ba8}.oz-log{max-height:140px;overflow-y:auto;font-size:9px;background:#11111b;border-radius:6px;padding:5px;color:#585b70;line-height:1.4;display:none;font-family:monospace}.oz-log.on{display:block}.oz-log i{padding:1px 0;border-bottom:1px solid #181825;display:block}.oz-msg{position:fixed;top:10px;left:50%;transform:translateX(-50%);padding:8px 18px;border-radius:8px;font-size:13px;z-index:2147483648;box-shadow:0 2px 12px rgba(0,0,0,0.5);pointer-events:none;animation:oz-fade 2.5s ease forwards}.oz-msg.ok{background:#a6e3a1;color:#1a1a2e}.oz-msg.err{background:#f38ba8;color:#1a1a2e}.oz-msg.inf{background:#89b4fa;color:#1a1a2e}@keyframes oz-fade{0%{opacity:0;top:20px}15%{opacity:1;top:10px}80%{opacity:1;top:10px}100%{opacity:0;top:0}}';
 
     function showMsg(txt, typ) {
-        const e = document.createElement('div');
+        var e = document.createElement('div');
         e.className = 'oz-msg ' + (typ || 'ok');
         e.textContent = txt;
         document.body.appendChild(e);
-        setTimeout(() => e.remove(), 2600);
+        setTimeout(function () { e.remove(); }, 2600);
     }
 
     function addLog(txt) {
-        const el = document.getElementById('oz-log');
+        var el = document.getElementById('oz-log');
         if (!el) return;
         el.classList.add('on');
-        const i = document.createElement('i');
-        i.textContent = '[' + new Date().toLocaleTimeString() + '] ' + txt;
-        el.prepend(i);
+        var item = document.createElement('i');
+        item.textContent = '[' + new Date().toLocaleTimeString() + '] ' + txt;
+        el.prepend(item);
         while (el.children.length > 80) el.lastChild.remove();
     }
 
-    let panelEl = null;
+    var panelEl = null;
+    var isRunning = false;
+    var keepAliveObserver = null;
 
     function updateUI() {
-        getAll().then(cats => {
-            const cnt = document.getElementById('oz-cnt');
-            const st = document.getElementById('oz-sta');
-            const inf = document.getElementById('oz-inf');
+        getAllItems().then(function (cats) {
+            var cnt = document.getElementById('oz-cnt');
+            var st = document.getElementById('oz-sta');
+            var inf = document.getElementById('oz-inf');
             if (cnt) cnt.textContent = cats.length;
-            if (st) { st.textContent = '待命中'; st.className = 'oz-lb idle'; }
+            if (st) {
+                st.textContent = isRunning ? '采集中...' : '待命中';
+                st.className = 'oz-lb ' + (isRunning ? 'run' : 'idle');
+            }
             if (inf) {
-                const l1c = cats.filter(c => c.level === 1).length;
-                const l2c = cats.filter(c => c.level === 2).length;
-                const l3c = cats.filter(c => c.level === 3).length;
-                const l4c = cats.filter(c => c.level === 4).length;
+                var l1c = 0, l2c = 0, l3c = 0, l4c = 0;
+                for (var i = 0; i < cats.length; i++) {
+                    if (cats[i].level === 1) l1c++;
+                    if (cats[i].level === 2) l2c++;
+                    if (cats[i].level === 3) l3c++;
+                    if (cats[i].level === 4) l4c++;
+                }
                 inf.innerHTML = 'L1:' + l1c + ' L2:' + l2c + ' L3:' + l3c + ' L4:' + l4c;
             }
-        }).catch(() => {});
+        }).catch(function () { });
+    }
+
+    // 保活机制：如果面板被 React 销毁，重新创建
+    function startKeepAlive() {
+        if (keepAliveObserver) return;
+        keepAliveObserver = new MutationObserver(function () {
+            if (!document.getElementById('oz-scraper') && /ozon\.ru/.test(location.hostname)) {
+                console.log('[OzonCat] Panel removed by React, recreating...');
+                createPanel();
+            }
+        });
+        keepAliveObserver.observe(document.body, { childList: true, subtree: true });
+    }
+
+    function stopKeepAlive() {
+        if (keepAliveObserver) {
+            keepAliveObserver.disconnect();
+            keepAliveObserver = null;
+        }
     }
 
     function createPanel() {
+        // 如果已经存在，先移除旧的
+        var old = document.getElementById('oz-scraper');
+        if (old) old.remove();
+
         GM_addStyle(CSS);
         panelEl = document.createElement('div');
         panelEl.id = 'oz-scraper';
-        panelEl.innerHTML = `
-<div class="oz-hd" id="oz-hd">
-  <div class="oz-lg">O</div>
-  <div class="oz-tt">Ozon 类目采集 v4</div>
-  <button class="oz-cl" id="oz-cl">✕</button>
-</div>
-<div class="oz-bd">
-  <div class="oz-st">
-    <span>已存</span><span class="oz-nm" id="oz-cnt">0</span><span>条</span>
-    <span class="oz-lb idle" id="oz-sta">待命中</span>
-  </div>
-  <div class="oz-inf" id="oz-inf">L1:0 L2:0 L3:0 L4:0</div>
-  <div class="oz-br">
-    <button class="oz-bt oz-scan" id="oz-go">▶ 采集本页</button>
-    <button class="oz-bt oz-stop" id="oz-off" disabled>■ 停</button>
-  </div>
-  <div class="oz-br">
-    <button class="oz-bt oz-csv" id="oz-csv">CSV</button>
-    <button class="oz-bt oz-xls" id="oz-xls">Excel</button>
-    <button class="oz-bt oz-md" id="oz-md">MD文档</button>
-  </div>
-  <button class="oz-clr" id="oz-clr">清空缓存数据</button>
-  <div class="oz-log" id="oz-log"></div>
-</div>`;
+        panelEl.innerHTML = '<div class="oz-hd" id="oz-hd">' +
+            '<div class="oz-lg">O</div>' +
+            '<div class="oz-tt">Ozon 类目采集 v5</div>' +
+            '<button class="oz-cl" id="oz-cl" title="关闭面板">✕</button>' +
+            '</div>' +
+            '<div class="oz-bd">' +
+            '<div class="oz-st">' +
+            '<span>已采集</span><span class="oz-nm" id="oz-cnt">0</span><span>条</span>' +
+            '<span class="oz-lb idle" id="oz-sta">待命中</span>' +
+            '</div>' +
+            '<div class="oz-inf" id="oz-inf">L1:0 L2:0 L3:0 L4:0</div>' +
+            '<div class="oz-br">' +
+            '<button class="oz-bt oz-scan" id="oz-go">▶ 采集本页</button>' +
+            '<button class="oz-bt oz-stop" id="oz-off" disabled>■ 停止</button>' +
+            '</div>' +
+            '<div class="oz-br">' +
+            '<button class="oz-bt oz-csv" id="oz-csv">CSV</button>' +
+            '<button class="oz-bt oz-xls" id="oz-xls">Excel</button>' +
+            '<button class="oz-bt oz-md" id="oz-md">MD文档</button>' +
+            '</div>' +
+            '<button class="oz-clr" id="oz-clr">清空缓存数据</button>' +
+            '<div class="oz-log" id="oz-log"></div>' +
+            '</div>';
         document.body.appendChild(panelEl);
 
-        // Draggable
-        const hd = document.getElementById('oz-hd');
-        let dx = 0, dy = 0, dr = false;
-        hd.addEventListener('mousedown', e => {
+        // 拖拽
+        var hd = document.getElementById('oz-hd');
+        var dx = 0, dy = 0, dragging = false;
+        hd.addEventListener('mousedown', function (e) {
             if (e.target.id === 'oz-cl') return;
-            dr = true; const r = panelEl.getBoundingClientRect();
-            dx = e.clientX - r.left; dy = e.clientY - r.top;
+            dragging = true;
+            var r = panelEl.getBoundingClientRect();
+            dx = e.clientX - r.left;
+            dy = e.clientY - r.top;
             hd.style.cursor = 'grabbing';
         });
-        document.addEventListener('mousemove', e => {
-            if (!dr) return;
-            const x = Math.max(0, Math.min(e.clientX - dx, innerWidth - panelEl.offsetWidth));
-            const y = Math.max(0, Math.min(e.clientY - dy, innerHeight - panelEl.offsetHeight));
-            panelEl.style.right = 'auto'; panelEl.style.top = y + 'px'; panelEl.style.left = x + 'px';
+        document.addEventListener('mousemove', function (e) {
+            if (!dragging) return;
+            var x = Math.max(0, Math.min(e.clientX - dx, window.innerWidth - panelEl.offsetWidth));
+            var y = Math.max(0, Math.min(e.clientY - dy, window.innerHeight - panelEl.offsetHeight));
+            panelEl.style.right = 'auto';
+            panelEl.style.top = y + 'px';
+            panelEl.style.left = x + 'px';
         });
-        document.addEventListener('mouseup', () => { if (dr) { dr = false; hd.style.cursor = 'grab'; } });
+        document.addEventListener('mouseup', function () {
+            if (dragging) { dragging = false; hd.style.cursor = 'grab'; }
+        });
 
-        document.getElementById('oz-go').addEventListener('click', scrapeCurrentPage);
-        document.getElementById('oz-off').addEventListener('click', () => {});
-        document.getElementById('oz-cl').addEventListener('click', () => panelEl.remove());
+        // 按钮事件
+        document.getElementById('oz-go').addEventListener('click', startScraping);
+        document.getElementById('oz-off').addEventListener('click', stopScraping);
+        document.getElementById('oz-cl').addEventListener('click', function () { stopKeepAlive(); panelEl.remove(); });
         document.getElementById('oz-csv').addEventListener('click', exportCSV);
         document.getElementById('oz-xls').addEventListener('click', exportExcel);
         document.getElementById('oz-md').addEventListener('click', exportMarkdown);
@@ -784,121 +752,70 @@
 
         updateUI();
 
-        // Expose debug
+        // 暴露调试接口
         window.__ozon = {
-            dump: () => {
-                const r = scrapeAllCategories();
-                console.log('=== L1 ===', r.l1);
-                console.log('=== L2 ===', r.l2);
-                console.log('=== L3+L4 SECTIONS ===', r.l3and4.length, 'sections');
-                r.l3and4.forEach((s, i) => {
-                    console.log('  [' + i + '] L3:', s.title, '→', s.links.length, 'L4 items');
-                });
-                return r;
-            },
-            save: async () => { const r = window.__ozon.dump(); await storeResults(r); },
-            cats: getAll,
+            scrape: scrapeCategories,
+            save: function (items) { return saveItems(items); },
+            getAll: getAllItems,
             clear: clearAll,
-            allLinks: () => {
-                const links = document.querySelectorAll('a');
-                const result = [];
-                links.forEach((l, i) => {
-                    if (!isChrome(l)) {
-                        result.push({ idx: i, text: safeText(l), href: l.getAttribute('href'), tag: l.outerHTML.substring(0, 120) });
-                    }
+            dump: function () {
+                scrapeCategories().then(function (items) {
+                    console.log('[OzonCat] 采集结果:', items.length, '条');
+                    console.table(items.map(function (c) {
+                        return { level: c.level, name: c.name, parent: c.parent, url: c.url ? c.url.substring(0, 50) : '' };
+                    }));
                 });
-                console.table(result.slice(0, 50));
-                return result;
             }
         };
+
+        // 启动保活
+        startKeepAlive();
     }
 
-    // ============================================================
-    // Scrape + Store
-    // ============================================================
-    async function scrapeCurrentPage() {
-        addLog('🔍 扫描中...');
-        showMsg('正在分析页面类目结构...', 'inf');
+    async function startScraping() {
+        if (isRunning) return;
+        isRunning = true;
 
-        const result = scrapeAllCategories();
-        const now = new Date().toISOString();
-        const items = [];
-
-        // L1
-        if (result.l1) {
-            items.push({
-                id: generateId(),
-                name: result.l1,
-                level: 1,
-                parent: '',
-                path: result.l1,
-                url: location.pathname,
-                emoji: '📁',
-                scrapedAt: now,
-            });
-        }
-
-        // L2
-        for (const item of result.l2) {
-            items.push({
-                id: generateId(),
-                name: item.name,
-                level: 2,
-                parent: result.l1,
-                path: (result.l1 ? result.l1 + ' > ' : '') + item.name,
-                url: item.url,
-                emoji: '📂',
-                scrapedAt: now,
-            });
-        }
-
-        // L3 + L4
-        for (const section of result.l3and4) {
-            const l3item = {
-                id: generateId(),
-                name: section.title,
-                level: 3,
-                parent: result.l2.length > 0 ? result.l2[0]?.name : result.l1,
-                path: (result.l1 ? result.l1 + ' > ' : '') + section.title,
-                url: '',
-                emoji: '📋',
-                scrapedAt: now,
-            };
-            items.push(l3item);
-
-            for (const link of section.links) {
-                // Determine which L2 this L4 belongs to
-                let parentL2 = result.l2.length > 0 ? result.l2[0]?.name : '';
-                items.push({
-                    id: generateId(),
-                    name: link.name,
-                    level: 4,
-                    parent: section.title,
-                    path: (result.l1 ? result.l1 + ' > ' : '') + (parentL2 ? parentL2 + ' > ' : '') + section.title + ' > ' + link.name,
-                    url: link.url,
-                    emoji: '📄',
-                    scrapedAt: now,
-                });
-            }
-        }
-
-        addLog('L1:' + (result.l1 ? '1' : '0') +
-               ' L2:' + result.l2.length +
-               ' L3:' + result.l3and4.length +
-               ' L4:' + result.l3and4.reduce((s, sec) => s + sec.links.length, 0));
-
-        if (items.length === 0) {
-            addLog('⚠ 未提取到类目！');
-            addLog('提示: 打开控制台运行 __ozon.dump() 查看详情');
-            showMsg('未提取到类目数据！打开 F12 控制台运行 __ozon.dump() 调试', 'err');
-            updateUI();
-            return;
-        }
-
-        await saveBatch(items);
-        addLog('✅ 保存 ' + items.length + ' 条');
-        showMsg('采集完成！L1~L4 共 ' + items.length + ' 条', 'ok');
+        var startBtn = document.getElementById('oz-go');
+        var stopBtn = document.getElementById('oz-off');
+        if (startBtn) startBtn.disabled = true;
+        if (stopBtn) stopBtn.disabled = false;
         updateUI();
+
+        showMsg('正在扫描类目，模拟悬停展开...', 'inf');
+        addLog('🔍 开始采集 ' + location.pathname);
+
+        try {
+            var items = await scrapeCategories();
+            addLog('发现 ' + items.length + ' 条类目');
+
+            if (items.length === 0) {
+                addLog('⚠ 未发现类目！');
+                showMsg('未发现类目数据！请确认当前是 Ozon 类目页', 'err');
+            } else {
+                await saveItems(items);
+                addLog('✅ 保存 ' + items.length + ' 条');
+                showMsg('采集完成！共 ' + items.length + ' 条', 'ok');
+            }
+        } catch (e) {
+            addLog('❌ 错误: ' + e.message);
+            showMsg('采集出错：' + e.message, 'err');
+        }
+
+        isRunning = false;
+        if (startBtn) startBtn.disabled = false;
+        if (stopBtn) stopBtn.disabled = true;
+        updateUI();
+    }
+
+    function stopScraping() {
+        isRunning = false;
+        var startBtn = document.getElementById('oz-go');
+        var stopBtn = document.getElementById('oz-off');
+        if (startBtn) startBtn.disabled = false;
+        if (stopBtn) stopBtn.disabled = true;
+        updateUI();
+        showMsg('已停止', 'ok');
     }
 
     async function clearData() {
@@ -910,14 +827,14 @@
     }
 
     // ============================================================
-    // Boot
+    // 启动
     // ============================================================
     function boot() {
         if (document.getElementById('oz-scraper')) return;
         if (!/ozon\.ru/.test(location.hostname)) return;
         if (/\/my\//.test(location.pathname) || /\/cart\//.test(location.pathname) || /\/checkout\//.test(location.pathname)) return;
 
-        console.log('[OzonCat] v4.0.0 boot', location.href);
+        console.log('[OzonCat] v5.0.0 boot', location.href);
         createPanel();
     }
 
@@ -926,4 +843,5 @@
     } else {
         boot();
     }
+
 })();
