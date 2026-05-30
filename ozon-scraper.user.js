@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Ozon Scraper - 产品类目爬取工具
+// @name         Ozon Scraper - 类目树爬取工具
 // @namespace    https://github.com/vision-png/ozon
-// @version      2.0.0
-// @description  手动采集 Ozon.ru 产品类目和搜索结果，支持 CSV/Excel 导出
+// @version      3.0.0
+// @description  手动采集 Ozon.ru 类目树结构，支持 CSV/Excel 导出
 // @author       Qin Yucheng
 // @match        https://www.ozon.ru/*
 // @match        https://ozon.ru/*
@@ -13,7 +13,6 @@
 // @grant        GM_addStyle
 // @connect      ozon.ru
 // @connect      www.ozon.ru
-// @connect      ir-2.ozon.ru
 // @license      MIT
 // @run-at       document-end
 // @updateURL    https://raw.githubusercontent.com/vision-png/ozon/main/ozon-scraper.user.js
@@ -28,59 +27,110 @@
     // Config
     // ============================================================
     const CONFIG = {
-        panelWidth: 320,
-        scrapeDelay: 800,
+        baseUrl: 'https://www.ozon.ru',
     };
 
     // ============================================================
-    // Adaptive selectors for Ozon's React CSS Modules
+    // Category Selectors — multi-strategy for Ozon's React SPA
     // ============================================================
-    const SELECTORS = {
-        productCards: [
-            '[data-widget="searchResultsV2"] a[href*="/product/"]',
-            '[data-widget="searchResults"] a[href*="/product/"]',
-            'a[href*="/product/"][class*="tile"]',
-            'div[class*="widget"] a[href*="/product/"]',
-            'a[href^="/product/"]',
+    const CAT_SELECTORS = {
+        // Strategy 1: Look for category widget containers
+        containers: [
+            '[data-widget="catalog"]',
+            '[data-widget="catalogNew"]',
+            '[class*="catalog"]',
+            '[class*="category"]',
         ],
-        categoryLinks: [
+        // Strategy 2: Category links inside main content area
+        catLinks: [
+            // Direct category links in main content
             'a[href*="/category/"]',
-            '[class*="catalog"] a',
-            'nav a[href*="/category/"]',
+        ],
+        // Exclude these areas (header, footer, sidebar nav dupes)
+        excludeAreas: [
+            'header', 'nav', 'footer',
+            '[class*="header"]', '[class*="footer"]',
+            '[class*="sidebar"]', '[class*="nav"]',
         ],
     };
 
     // ============================================================
     // Utilities
     // ============================================================
-    function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
     function safeText(el) { return el ? (el.innerText || el.textContent || '').trim() : ''; }
-
-    function parsePrice(str) {
-        if (!str) return null;
-        const n = parseFloat(str.replace(/[^\d,.]/g, '').replace(/\s/g, '').replace(',', '.'));
-        return isNaN(n) ? null : n;
-    }
-
-    function extractSku(url) {
-        const m = (url || '').match(/-(\d+)\/?/);
-        return m ? m[1] : '';
-    }
 
     function buildUrl(path) {
         if (!path) return '';
         if (path.startsWith('http')) return path;
-        return 'https://www.ozon.ru' + (path.startsWith('/') ? '' : '/') + path;
+        return CONFIG.baseUrl + (path.startsWith('/') ? '' : '/') + path;
     }
 
     function generateId() {
         return Date.now().toString(36) + Math.random().toString(36).substr(2, 6);
     }
 
+    // Extract category slug from URL
+    function extractSlug(url) {
+        // /category/some-slug-12345/ → some-slug-12345
+        const m = (url || '').match(/\/category\/([^/]+)/);
+        return m ? m[1] : '';
+    }
+
+    // Determine the "level" of a category based on current page context
+    function getCurrentLevel() {
+        const path = location.pathname;
+        // / → top-level categories grid
+        if (path === '/' || path === '/category/' || path === '/category') return 1;
+        // /category/xxx-12345/ → level 2, /category/xxx/category/yyy/ → level 3
+        const parts = path.split('/').filter(Boolean);
+        let depth = 0;
+        for (const p of parts) {
+            if (p === 'category') depth++;
+        }
+        return depth;
+    }
+
+    // Guess parent info from breadcrumbs or URL
+    function getParentInfo() {
+        // Try breadcrumbs
+        const breadEls = document.querySelectorAll(
+            '[class*="bread"] a, [data-widget="breadcrumbs"] a, nav[aria-label*="bread"] a'
+        );
+        const crumbs = [];
+        for (const el of breadEls) {
+            const t = safeText(el);
+            const href = el.getAttribute('href') || '';
+            if (t && t.length > 1 && t.length < 80) {
+                crumbs.push({ name: t, url: href });
+            }
+        }
+        if (crumbs.length > 0) {
+            const parent = crumbs[crumbs.length - 1];
+            return { parentName: parent.name, parentUrl: parent.url };
+        }
+
+        // Fallback: derive from current URL
+        // If on /category/bytovaya-tehnika-10500/, parent is "/"
+        const path = location.pathname;
+        if (/\/category\/[^/]+/.test(path) && !/\/category\/[^/]+\/category\//.test(path)) {
+            return { parentName: 'Все категории', parentUrl: '/category/' };
+        }
+
+        return { parentName: '', parentUrl: '' };
+    }
+
+    function isExcluded(el) {
+        for (const sel of CAT_SELECTORS.excludeAreas) {
+            if (el.closest(sel)) return true;
+        }
+        return false;
+    }
+
     // ============================================================
-    // IndexedDB Storage
+    // IndexedDB Storage — Categories
     // ============================================================
-    const DB_NAME = 'OzonScraperDB';
+    const DB_NAME = 'OzonCatDB';
+    const STORE_NAME = 'categories';
     let dbInstance = null;
 
     function initDB() {
@@ -89,10 +139,11 @@
             const req = indexedDB.open(DB_NAME, 1);
             req.onupgradeneeded = (e) => {
                 const db = e.target.result;
-                if (!db.objectStoreNames.contains('products')) {
-                    const store = db.createObjectStore('products', { keyPath: 'id' });
-                    store.createIndex('sku', 'sku', { unique: false });
-                    store.createIndex('category', 'category', { unique: false });
+                if (!db.objectStoreNames.contains(STORE_NAME)) {
+                    const store = db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+                    store.createIndex('slug', 'slug', { unique: true });
+                    store.createIndex('level', 'level', { unique: false });
+                    store.createIndex('parentUrl', 'parentUrl', { unique: false });
                 }
             };
             req.onsuccess = (e) => { dbInstance = e.target.result; resolve(dbInstance); };
@@ -100,165 +151,164 @@
         });
     }
 
-    async function saveProduct(product) {
+    async function saveCategory(cat) {
         const db = await initDB();
         return new Promise((resolve, reject) => {
-            const tx = db.transaction('products', 'readwrite');
-            const store = tx.objectStore('products');
-            const req = store.put(product);
-            req.onsuccess = () => resolve();
-            req.onerror = (e) => reject(e.target.error);
+            const tx = db.transaction(STORE_NAME, 'readwrite');
+            const store = tx.objectStore(STORE_NAME);
+            // Use slug as dedup key — update if exists
+            const idx = store.index('slug');
+            const getReq = idx.getKey(cat.slug);
+            getReq.onsuccess = () => {
+                if (getReq.result) {
+                    // Update existing
+                    cat.id = getReq.result;
+                }
+                const putReq = store.put(cat);
+                putReq.onsuccess = () => resolve();
+                putReq.onerror = (e) => reject(e.target.error);
+            };
+            getReq.onerror = () => {
+                // If index doesn't work, just put
+                const putReq = store.put(cat);
+                putReq.onsuccess = () => resolve();
+                putReq.onerror = (e) => reject(e.target.error);
+            };
         });
     }
 
-    async function getAllProducts() {
+    async function getAllCategories() {
         const db = await initDB();
         return new Promise((resolve, reject) => {
-            const tx = db.transaction('products', 'readonly');
-            const store = tx.objectStore('products');
+            const tx = db.transaction(STORE_NAME, 'readonly');
+            const store = tx.objectStore(STORE_NAME);
             const req = store.getAll();
-            req.onsuccess = () => resolve(req.result || []);
+            req.onsuccess = () => {
+                const results = req.result || [];
+                // Sort by level then name
+                results.sort((a, b) => {
+                    if (a.level !== b.level) return a.level - b.level;
+                    return (a.name || '').localeCompare(b.name || '');
+                });
+                resolve(results);
+            };
             req.onerror = (e) => reject(e.target.error);
         });
     }
 
-    async function clearAllProducts() {
+    async function countCategories() {
         const db = await initDB();
         return new Promise((resolve, reject) => {
-            const tx = db.transaction('products', 'readwrite');
-            const store = tx.objectStore('products');
-            const req = store.clear();
-            req.onsuccess = () => resolve();
-            req.onerror = (e) => reject(e.target.error);
-        });
-    }
-
-    async function countProducts() {
-        const db = await initDB();
-        return new Promise((resolve, reject) => {
-            const tx = db.transaction('products', 'readonly');
-            const store = tx.objectStore('products');
+            const tx = db.transaction(STORE_NAME, 'readonly');
+            const store = tx.objectStore(STORE_NAME);
             const req = store.count();
             req.onsuccess = () => resolve(req.result);
             req.onerror = (e) => reject(e.target.error);
         });
     }
 
-    // ============================================================
-    // Scraping Engine
-    // ============================================================
-    function getCurrentCategory() {
-        // Try breadcrumbs first
-        const crumbs = document.querySelectorAll('[class*="breadcrumb"] a, [class*="bread"] a, nav[aria-label] a');
-        const parts = [];
-        for (const c of crumbs) {
-            const t = safeText(c);
-            if (t && t.length > 1 && t.length < 50) parts.push(t);
-        }
-        if (parts.length > 0) return parts.join(' > ');
-
-        // Fallback: path
-        const pathParts = location.pathname.split('/').filter(p => p && p !== 'category');
-        return pathParts.join(' > ') || '';
+    async function clearAllCategories() {
+        const db = await initDB();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(STORE_NAME, 'readwrite');
+            const store = tx.objectStore(STORE_NAME);
+            const req = store.clear();
+            req.onsuccess = () => resolve();
+            req.onerror = (e) => reject(e.target.error);
+        });
     }
 
-    function scrapeProducts() {
-        const category = getCurrentCategory();
+    // ============================================================
+    // Category Scraping Engine
+    // ============================================================
+    function scrapeCategories() {
+        const currentLevel = getCurrentLevel();
+        const { parentName, parentUrl } = getParentInfo();
         const now = new Date().toISOString();
+        const currentPageUrl = location.pathname + location.search;
         const scraped = [];
         const seen = new Set();
 
-        // Try each selector strategy
-        let links = [];
-        for (const sel of SELECTORS.productCards) {
-            try {
-                const found = document.querySelectorAll(sel);
-                if (found.length > 0) {
-                    links = Array.from(found);
-                    break;
-                }
-            } catch (e) { /* next */ }
-        }
+        // Strategy: Find category links, excluding header/footer nav
+        const allCatLinks = document.querySelectorAll('a[href*="/category/"]');
 
-        console.log('[OzonScraper] Found', links.length, 'product links');
+        console.log('[OzonCat] Found', allCatLinks.length, 'total category links on page');
 
-        for (const link of links) {
+        for (const link of allCatLinks) {
             const href = link.getAttribute('href') || '';
-            const sku = extractSku(href);
-            if (!sku || seen.has(sku)) continue;
-            seen.add(sku);
+            const slug = extractSlug(href);
+            if (!slug) continue;
 
-            // Find the parent card element
-            const card = link.closest('[class*="widget"], [class*="tile"], [class*="card"], [class*="item"], div') || link;
+            // Skip duplicates (same slug)
+            if (seen.has(slug)) continue;
+            seen.add(slug);
 
-            // Extract name
-            let name = '';
-            const nameEl = card.querySelector('span[class*="tsBody"], h3, a[class*="tsBody"], span');
-            name = safeText(nameEl) || safeText(link);
-            if (!name || name.length < 2) name = href.split('/').filter(Boolean).pop() || '';
+            // Skip excluded areas
+            if (isExcluded(link)) continue;
 
-            // Extract price
-            let price = null;
-            const priceEls = card.querySelectorAll('span');
-            for (const el of priceEls) {
-                const t = safeText(el);
-                if (/\d/.test(t) && (t.includes('₽') || t.includes('\u20BD'))) {
-                    const p = parsePrice(t);
-                    if (p !== null) { price = p; break; }
-                }
-            }
+            // Skip current page link (self-referencing)
+            if (href === currentPageUrl || href === location.pathname) continue;
 
-            // Extract old price
-            let oldPrice = null;
-            const crossed = card.querySelectorAll('s, [class*="old"], [class*="crossed"]');
-            for (const el of crossed) {
-                const p = parsePrice(safeText(el));
-                if (p !== null && p > (price || 0)) { oldPrice = p; break; }
-            }
+            // Skip utility links (back to all categories, etc.)
+            const text = safeText(link).toLowerCase();
+            if (text === 'все категории' || text === 'назад' || text === 'all categories') continue;
+            if (!text || text.length < 2) continue;
 
-            // Extract rating
-            let rating = null;
-            const ratingEl = card.querySelector('[class*="rating"], [class*="star"], [class*="ra"]');
-            if (ratingEl) {
-                const r = parseFloat(safeText(ratingEl));
-                if (!isNaN(r) && r <= 5) rating = r;
-            }
+            // Find the parent card/container for more context
+            const card = link.closest('[class*="widget"], [class*="tile"], [class*="card"], [class*="item"], [class*="cell"]');
 
-            // Extract review count
-            let reviews = null;
-            const reviewEls = card.querySelectorAll('span, a');
-            for (const el of reviewEls) {
-                const t = safeText(el);
-                if (/^\d+$/.test(t) && parseInt(t) > 0 && parseInt(t) < 100000) {
-                    reviews = parseInt(t);
-                     // Only use if it looks like a review count (adjacent to rating or icon)
-                    if (el.closest('[class*="review"], [class*="rating"]') || rating !== null) {
-                        break;
-                    }
-                }
-            }
-
-            // Extract image
+            // Try to get image
             let imageUrl = '';
-            const img = card.querySelector('img');
-            if (img) imageUrl = img.src || img.getAttribute('data-src') || '';
+            if (card) {
+                const img = card.querySelector('img');
+                if (img) imageUrl = img.src || img.getAttribute('data-src') || '';
+            }
 
-            scraped.push({
+            // Try to count children — look for nested category links inside this card
+            let childrenCount = 0;
+            if (card) {
+                childrenCount = card.querySelectorAll('a[href*="/category/"]').length - 1; // exclude self
+            }
+
+            const cat = {
                 id: generateId(),
-                sku: sku,
-                name: name,
-                priceRub: price,
-                originalPriceRub: oldPrice,
-                rating: rating,
-                reviews: reviews,
-                category: category,
+                name: text,
+                url: href,
+                fullUrl: buildUrl(href),
+                slug: slug,
+                level: currentLevel + 1, // child of current page
+                parentUrl: parentUrl || currentPageUrl,
+                parentName: parentName || 'Все категории',
                 imageUrl: imageUrl,
-                url: buildUrl(href),
+                childrenCount: Math.max(0, childrenCount),
                 scrapedAt: now,
-            });
+            };
+
+            scraped.push(cat);
         }
 
-        return scraped;
+        // ============================================================
+        // Post-filtering: remove nav-like duplicates
+        // Filter out links that look like they came from the global nav
+        // by keeping only those inside main content widgets/cards
+        // ============================================================
+
+        // If we found cards with widget containers, prioritize those
+        const fromCards = scraped.filter(c => c.childrenCount > 0 || c.imageUrl);
+        const result = fromCards.length > 0 ? fromCards : scraped;
+
+        // Deduplicate by name within same level
+        const deduped = [];
+        const nameSeen = new Set();
+        for (const c of result) {
+            const key = c.level + '|' + c.name;
+            if (!nameSeen.has(key)) {
+                nameSeen.add(key);
+                deduped.push(c);
+            }
+        }
+
+        return deduped;
     }
 
     // ============================================================
@@ -271,6 +321,7 @@
             'https://cdn.jsdelivr.net/npm/xlsx@0.20.3/dist/xlsx.full.min.js',
         ];
         return new Promise((resolve) => {
+            if (typeof XLSX !== 'undefined') { resolve(true); return; }
             let idx = 0;
             function tryNext() {
                 if (idx >= urls.length) { resolve(false); return; }
@@ -298,37 +349,35 @@
     }
 
     async function exportCSV() {
-        const products = await getAllProducts();
-        if (products.length === 0) {
-            alert('没有数据可导出！请先采集商品。');
+        const cats = await getAllCategories();
+        if (cats.length === 0) {
+            alert('没有数据可导出！请先在类目页面点击"开始采集"。');
             return;
         }
         const BOM = '\uFEFF';
-        const h = ['SKU','名称','价格(RUB)','原价(RUB)','折扣%','评分','评论数','类目','URL','图片','采集时间'];
-        const rows = products.map(p => {
-            const disc = (p.originalPriceRub && p.priceRub) ? Math.round((1 - p.priceRub / p.originalPriceRub) * 100) + '%' : '';
+        const h = ['层级','类目名','完整路径','父类目','URL','子类目数','抓取时间'];
+        const rows = cats.map(c => {
+            const fullPath = c.parentName && c.parentName !== 'Все категории'
+                ? c.parentName + ' > ' + c.name
+                : c.name;
             return [
-                p.sku || '',
-                '"' + (p.name || '').replace(/"/g, '""') + '"',
-                p.priceRub ?? '',
-                p.originalPriceRub ?? '',
-                disc,
-                p.rating || '',
-                p.reviews || '',
-                '"' + (p.category || '').replace(/"/g, '""') + '"',
-                p.url || '',
-                p.imageUrl || '',
-                p.scrapedAt || '',
+                c.level || '',
+                '"' + (c.name || '').replace(/"/g, '""') + '"',
+                '"' + (fullPath || '').replace(/"/g, '""') + '"',
+                '"' + (c.parentName || '').replace(/"/g, '""') + '"',
+                c.fullUrl || '',
+                c.childrenCount ?? '',
+                c.scrapedAt || '',
             ].join(',');
         });
-        downloadBlob(BOM + h.join(',') + '\n' + rows.join('\n'), 'ozon-products-' + Date.now() + '.csv', 'text/csv;charset=utf-8');
-        showMsg('CSV 导出完成！共 ' + products.length + ' 条', 'ok');
+        downloadBlob(BOM + h.join(',') + '\n' + rows.join('\n'), 'ozon-categories-' + Date.now() + '.csv', 'text/csv;charset=utf-8');
+        showMsg('CSV 导出完成！共 ' + cats.length + ' 条类目', 'ok');
     }
 
     async function exportExcel() {
-        const products = await getAllProducts();
-        if (products.length === 0) {
-            alert('没有数据可导出！请先采集商品。');
+        const cats = await getAllCategories();
+        if (cats.length === 0) {
+            alert('没有数据可导出！请先在类目页面点击"开始采集"。');
             return;
         }
         if (typeof XLSX === 'undefined') {
@@ -336,28 +385,32 @@
             const ok = await loadSheetJS();
             if (!ok) { showMsg('Excel 库加载失败，请用 CSV 导出', 'err'); return; }
         }
-        const data = products.map(p => {
-            const disc = (p.originalPriceRub && p.priceRub) ? Math.round((1 - p.priceRub / p.originalPriceRub) * 100) + '%' : '';
-            return {
-                'SKU': p.sku || '',
-                '名称': p.name || '',
-                '价格(RUB)': p.priceRub ?? '',
-                '原价(RUB)': p.originalPriceRub ?? '',
-                '折扣%': disc,
-                '评分': p.rating || '',
-                '评论数': p.reviews || '',
-                '类目': p.category || '',
-                'URL': p.url || '',
-                '图片': p.imageUrl || '',
-                '采集时间': p.scrapedAt || '',
-            };
-        });
+        const data = cats.map(c => ({
+            '层级': c.level || '',
+            '类目名': c.name || '',
+            '完整路径': (c.parentName && c.parentName !== 'Все категории' ? c.parentName + ' > ' + c.name : c.name),
+            '父类目': c.parentName || '',
+            'URL': c.fullUrl || '',
+            '子类目数': c.childrenCount ?? '',
+            '抓取时间': c.scrapedAt || '',
+        }));
         const ws = XLSX.utils.json_to_sheet(data);
+        // Auto-fit column widths
+        const colWidths = [
+            { wch: 6 },   // 层级
+            { wch: 35 },  // 类目名
+            { wch: 50 },  // 完整路径
+            { wch: 30 },  // 父类目
+            { wch: 60 },  // URL
+            { wch: 10 },  // 子类目数
+            { wch: 22 },  // 抓取时间
+        ];
+        ws['!cols'] = colWidths;
         const wb = XLSX.utils.book_new();
-        XLSX.utils.book_append_sheet(wb, ws, 'Ozon');
+        XLSX.utils.book_append_sheet(wb, ws, 'Ozon类目');
         const buf = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
-        downloadBlob(new Blob([buf], { type: 'application/octet-stream' }), 'ozon-products-' + Date.now() + '.xlsx');
-        showMsg('Excel 导出完成！共 ' + products.length + ' 条', 'ok');
+        downloadBlob(new Blob([buf], { type: 'application/octet-stream' }), 'ozon-categories-' + Date.now() + '.xlsx');
+        showMsg('Excel 导出完成！共 ' + cats.length + ' 条类目', 'ok');
     }
 
     // ============================================================
@@ -373,8 +426,6 @@
     border: 1px solid #333;
     user-select: none;
 }
-#oz-scraper.mini { width: 36px; height: 36px; border-radius: 50%; overflow: hidden; cursor: pointer; }
-#oz-scraper.mini .oz-body { display: none; }
 .oz-head {
     display: flex; align-items: center; padding: 6px 10px;
     background: #252540; border-radius: 10px 10px 0 0; border-bottom: 1px solid #333;
@@ -385,8 +436,7 @@
     width: 20px; height: 20px; border-radius: 4px;
     background: linear-gradient(135deg, #667eea, #764ba2);
     display: flex; align-items: center; justify-content: center;
-    font-size: 11px; flex-shrink: 0;
-    color: #fff;
+    font-size: 11px; flex-shrink: 0; color: #fff;
 }
 .oz-head .oz-title { flex: 1; font-weight: 700; color: #cdd6f4; font-size: 12px; letter-spacing: 0.3px; }
 .oz-head .oz-btn-close {
@@ -404,8 +454,11 @@
 .oz-stat .oz-status { font-size: 10px; padding: 2px 6px; border-radius: 8px; }
 .oz-stat .oz-status.idle { background: #333; color: #888; }
 .oz-stat .oz-status.running { background: #1a3a1a; color: #a6e3a1; animation: oz-pulse 1s infinite; }
-.oz-stat .oz-status.stopped { background: #3a1a1a; color: #f38ba8; }
 @keyframes oz-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.6; } }
+.oz-info {
+    font-size: 10px; color: #6c7086; padding: 2px 4px;
+    background: #11111b; border-radius: 4px; text-align: center;
+}
 .oz-btn-row { display: flex; gap: 5px; }
 .oz-btn {
     flex: 1; padding: 10px 8px; border: none; border-radius: 8px;
@@ -420,6 +473,14 @@
 .oz-btn-xlsx  { background: #a6e3a1; color: #1a1a2e; font-size: 11px; padding: 6px 8px; }
 .oz-btn-clear { background: none; border: 1px solid #45475a; color: #888; font-size: 10px; padding: 6px 8px; border-radius: 6px; cursor: pointer; margin-top: 2px; }
 .oz-btn-clear:hover { color: #f38ba8; border-color: #f38ba8; }
+.oz-log {
+    max-height: 200px; overflow-y: auto; font-size: 10px;
+    background: #11111b; border-radius: 6px; padding: 6px;
+    color: #6c7086; line-height: 1.4;
+    display: none;
+}
+.oz-log.show { display: block; }
+.oz-log .oz-log-item { padding: 1px 0; border-bottom: 1px solid #1a1a2e; }
 .oz-msg {
     position: fixed; top: 10px; left: 50%; transform: translateX(-50%);
     padding: 8px 18px; border-radius: 8px; font-size: 13px; z-index: 2147483648;
@@ -433,7 +494,7 @@
 `;
 
     // ============================================================
-    // UI: Toast
+    // UI: Toast & Log
     // ============================================================
     function showMsg(text, type) {
         const el = document.createElement('div');
@@ -441,6 +502,19 @@
         el.textContent = text;
         document.body.appendChild(el);
         setTimeout(() => el.remove(), 2600);
+    }
+
+    function addLog(text) {
+        const logEl = document.getElementById('oz-log');
+        if (!logEl) return;
+        logEl.classList.add('show');
+        const item = document.createElement('div');
+        item.className = 'oz-log-item';
+        const time = new Date().toLocaleTimeString();
+        item.textContent = '[' + time + '] ' + text;
+        logEl.insertBefore(item, logEl.firstChild);
+        // Keep max 50 entries
+        while (logEl.children.length > 50) logEl.lastChild.remove();
     }
 
     // ============================================================
@@ -451,13 +525,19 @@
     let panelEl = null;
 
     function updateStatus() {
-        countProducts().then(n => {
+        countCategories().then(n => {
             const cnt = document.getElementById('oz-count');
             const st = document.getElementById('oz-status');
+            const info = document.getElementById('oz-info');
             if (cnt) cnt.textContent = n;
             if (st) {
-                st.textContent = isRunning ? '采集中' : '待命中';
+                st.textContent = isRunning ? '采集中...' : '待命中';
                 st.className = 'oz-status ' + (isRunning ? 'running' : 'idle');
+            }
+            if (info) {
+                const lvl = getCurrentLevel();
+                const pageLabel = lvl === 1 ? '顶级类目页' : lvl === 2 ? '二级类目页' : '更深层级';
+                info.textContent = '当前: ' + pageLabel + ' | 已采 ' + n + ' 条';
             }
         }).catch(() => {});
     }
@@ -469,19 +549,20 @@
         panelEl.id = 'oz-scraper';
         panelEl.innerHTML = `
             <div class="oz-head" id="oz-head">
-                <div class="oz-logo">O</div>
-                <div class="oz-title">Ozon Scraper</div>
+                <div class="oz-logo">C</div>
+                <div class="oz-title">Ozon 类目采集</div>
                 <button class="oz-btn-close" id="oz-close" title="关闭面板">✕</button>
             </div>
             <div class="oz-body">
                 <div class="oz-stat">
                     <span>已采集</span>
                     <span class="oz-count" id="oz-count">0</span>
-                    <span>条</span>
+                    <span>条类目</span>
                     <span class="oz-status idle" id="oz-status">待命中</span>
                 </div>
+                <div class="oz-info" id="oz-info">当前: -- | 已采 0 条</div>
                 <div class="oz-btn-row">
-                    <button class="oz-btn oz-btn-start" id="oz-start">▶ 开始采集</button>
+                    <button class="oz-btn oz-btn-start" id="oz-start">▶ 采集本页</button>
                     <button class="oz-btn oz-btn-stop" id="oz-stop" disabled>■ 停止</button>
                 </div>
                 <div class="oz-btn-row">
@@ -489,14 +570,13 @@
                     <button class="oz-btn oz-btn-xlsx" id="oz-xlsx">导出 Excel</button>
                 </div>
                 <button class="oz-btn-clear" id="oz-clear">清空数据</button>
+                <div class="oz-log" id="oz-log"></div>
             </div>
         `;
         document.body.appendChild(panelEl);
 
-        // Draggable
         makeDraggable();
 
-        // Bind events
         document.getElementById('oz-start').addEventListener('click', startScraping);
         document.getElementById('oz-stop').addEventListener('click', stopScraping);
         document.getElementById('oz-close').addEventListener('click', () => panelEl.remove());
@@ -504,11 +584,17 @@
         document.getElementById('oz-xlsx').addEventListener('click', exportExcel);
         document.getElementById('oz-clear').addEventListener('click', clearData);
 
-        // Initial count
         updateStatus();
-
-        // Expose for console debugging
-        window.__ozonScraper = { start: startScraping, stop: stopScraping, exportCSV, exportExcel, clearData, status: () => isRunning };
+        window.__ozonScraper = {
+            start: startScraping, stop: stopScraping,
+            exportCSV, exportExcel, clearData,
+            status: () => isRunning,
+            debug: () => {
+                const cats = scrapeCategories();
+                console.table(cats.map(c => ({ name: c.name, level: c.level, parent: c.parentName, slug: c.slug })));
+                return cats;
+            }
+        };
     }
 
     function makeDraggable() {
@@ -548,19 +634,44 @@
 
         const startBtn = document.getElementById('oz-start');
         const stopBtn = document.getElementById('oz-stop');
-        startBtn.disabled = true;
-        stopBtn.disabled = false;
+        if (startBtn) startBtn.disabled = true;
+        if (stopBtn) stopBtn.disabled = false;
         updateStatus();
 
-        showMsg('开始采集当前页面商品...', 'info');
-        await scrapeAndSave();
+        showMsg('正在采集当前页面类目...', 'info');
+        addLog('开始采集 ' + location.pathname);
+
+        const cats = scrapeCategories();
+        addLog('发现 ' + cats.length + ' 个类目链接');
+
+        if (cats.length === 0) {
+            addLog('⚠ 未发现类目！当前页面可能不是类目页');
+            showMsg('未发现类目链接！请浏览到 Ozon 类目页面（如 /category/）', 'info');
+        } else {
+            let saved = 0;
+            let skipped = 0;
+            for (const cat of cats) {
+                try {
+                    await saveCategory(cat);
+                    saved++;
+                } catch (e) {
+                    skipped++;
+                }
+            }
+            const lvl = cats[0].level || '?';
+            addLog('保存: ' + saved + ' 条 | 层级: ' + lvl);
+            showMsg('采集完成！保存 ' + saved + ' 条类目 (层级 ' + lvl + ')', 'ok');
+        }
+
+        // Auto-stop after one scrape
+        stopScraping(false);
         updateStatus();
 
-        // Activate MutationObserver to detect new products as user navigates
+        // Start observer to detect navigation to new pages
         startObserver();
     }
 
-    function stopScraping() {
+    function stopScraping(showToast = true) {
         isRunning = false;
         stopObserver();
 
@@ -569,66 +680,49 @@
         if (startBtn) startBtn.disabled = false;
         if (stopBtn) stopBtn.disabled = true;
         updateStatus();
-        showMsg('已停止采集', 'ok');
-    }
-
-    async function scrapeAndSave() {
-        const products = scrapeProducts();
-        if (products.length === 0) {
-            showMsg('当前页面未发现商品链接，请浏览到商品列表页', 'info');
-            return;
-        }
-        let saved = 0;
-        for (const p of products) {
-            await saveProduct(p);
-            saved++;
-        }
-        showMsg('采集完成！本页 ' + saved + ' 个商品', 'ok');
+        if (showToast) showMsg('已停止', 'ok');
     }
 
     function startObserver() {
         stopObserver();
         observer = new MutationObserver(() => {
-            if (!isRunning) return;
-            // Check if page content changed (user navigated to new category)
-            const links = document.querySelectorAll('a[href*="/product/"]');
-            if (links.length > 0) {
-                // Debounce: wait for page to settle, then scrape
-                clearTimeout(window.__oz_obs_timer);
-                window.__oz_obs_timer = setTimeout(() => {
-                    if (isRunning) scrapeAndSave().then(updateStatus);
-                }, 2000);
+            // Detect SPA navigation — URL changed or content replaced
+            const currentPath = location.pathname + location.search;
+            if (window.__oz_last_path && window.__oz_last_path !== currentPath) {
+                window.__oz_last_path = currentPath;
+                addLog('检测到页面切换: ' + currentPath);
+                updateStatus(); // Update level display
             }
+            window.__oz_last_path = currentPath;
         });
         observer.observe(document.body, { childList: true, subtree: true });
+        window.__oz_last_path = location.pathname + location.search;
     }
 
     function stopObserver() {
         if (observer) { observer.disconnect(); observer = null; }
-        clearTimeout(window.__oz_obs_timer);
     }
 
     async function clearData() {
-        if (!confirm('确定要清空所有已采集的数据吗？')) return;
-        await clearAllProducts();
+        if (!confirm('确定要清空所有已采集的类目数据吗？')) return;
+        await clearAllCategories();
+        addLog('数据已清空');
         updateStatus();
         showMsg('数据已清空', 'ok');
     }
 
     // ============================================================
-    // Boot: Always show panel
+    // Boot
     // ============================================================
     function boot() {
         if (document.getElementById('oz-scraper')) return;
         if (!/ozon\.ru/.test(location.hostname)) return;
-        // Skip purely personal pages
         if (/\/my\//.test(location.pathname) || /\/cart\//.test(location.pathname)) return;
 
-        console.log('[OzonScraper] v2.0.0 boot on', location.href);
+        console.log('[OzonCat] v3.0.0 boot on', location.href);
         createPanel();
     }
 
-    // Run immediately — no waiting for React, no retry logic
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', boot);
     } else {
