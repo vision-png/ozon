@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Ozon Scraper - 类目树爬取工具
+// @name         Ozon Scraper - 四层类目树采集 + MD导出
 // @namespace    https://github.com/vision-png/ozon
-// @version      3.0.0
-// @description  手动采集 Ozon.ru 类目树结构，支持 CSV/Excel 导出
+// @version      4.0.0
+// @description  采集 Ozon.ru 类目树（一级→二级→三级→四级），导出 CSV / Excel / Markdown
 // @author       Qin Yucheng
 // @match        https://www.ozon.ru/*
 // @match        https://ozon.ru/*
@@ -11,6 +11,7 @@
 // @grant        GM_deleteValue
 // @grant        GM_listValues
 // @grant        GM_addStyle
+// @grant        GM_xmlhttpRequest
 // @connect      ozon.ru
 // @connect      www.ozon.ru
 // @license      MIT
@@ -26,110 +27,406 @@
     // ============================================================
     // Config
     // ============================================================
-    const CONFIG = {
-        baseUrl: 'https://www.ozon.ru',
-    };
-
-    // ============================================================
-    // Category Selectors — multi-strategy for Ozon's React SPA
-    // ============================================================
-    const CAT_SELECTORS = {
-        // Strategy 1: Look for category widget containers
-        containers: [
-            '[data-widget="catalog"]',
-            '[data-widget="catalogNew"]',
-            '[class*="catalog"]',
-            '[class*="category"]',
-        ],
-        // Strategy 2: Category links inside main content area
-        catLinks: [
-            // Direct category links in main content
-            'a[href*="/category/"]',
-        ],
-        // Exclude these areas (header, footer, sidebar nav dupes)
-        excludeAreas: [
-            'header', 'nav', 'footer',
-            '[class*="header"]', '[class*="footer"]',
-            '[class*="sidebar"]', '[class*="nav"]',
-        ],
-    };
+    const BASE = 'https://www.ozon.ru';
 
     // ============================================================
     // Utilities
     // ============================================================
-    function safeText(el) { return el ? (el.innerText || el.textContent || '').trim() : ''; }
+    function safeText(el) {
+        return el ? (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim() : '';
+    }
 
     function buildUrl(path) {
         if (!path) return '';
         if (path.startsWith('http')) return path;
-        return CONFIG.baseUrl + (path.startsWith('/') ? '' : '/') + path;
+        return BASE + (path.startsWith('/') ? '' : '/') + path;
     }
 
     function generateId() {
-        return Date.now().toString(36) + Math.random().toString(36).substr(2, 6);
+        return Date.now().toString(36) + Math.random().toString(36).substr(2, 8);
     }
 
-    // Extract category slug from URL
-    function extractSlug(url) {
-        // /category/some-slug-12345/ → some-slug-12345
-        const m = (url || '').match(/\/category\/([^/]+)/);
-        return m ? m[1] : '';
-    }
+    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-    // Determine the "level" of a category based on current page context
-    function getCurrentLevel() {
-        const path = location.pathname;
-        // / → top-level categories grid
-        if (path === '/' || path === '/category/' || path === '/category') return 1;
-        // /category/xxx-12345/ → level 2, /category/xxx/category/yyy/ → level 3
-        const parts = path.split('/').filter(Boolean);
-        let depth = 0;
-        for (const p of parts) {
-            if (p === 'category') depth++;
-        }
-        return depth;
-    }
+    // ============================================================
+    // DOM Context Helpers
+    // ============================================================
 
-    // Guess parent info from breadcrumbs or URL
-    function getParentInfo() {
-        // Try breadcrumbs
-        const breadEls = document.querySelectorAll(
-            '[class*="bread"] a, [data-widget="breadcrumbs"] a, nav[aria-label*="bread"] a'
-        );
-        const crumbs = [];
-        for (const el of breadEls) {
-            const t = safeText(el);
-            const href = el.getAttribute('href') || '';
-            if (t && t.length > 1 && t.length < 80) {
-                crumbs.push({ name: t, url: href });
-            }
-        }
-        if (crumbs.length > 0) {
-            const parent = crumbs[crumbs.length - 1];
-            return { parentName: parent.name, parentUrl: parent.url };
-        }
-
-        // Fallback: derive from current URL
-        // If on /category/bytovaya-tehnika-10500/, parent is "/"
-        const path = location.pathname;
-        if (/\/category\/[^/]+/.test(path) && !/\/category\/[^/]+\/category\//.test(path)) {
-            return { parentName: 'Все категории', parentUrl: '/category/' };
-        }
-
-        return { parentName: '', parentUrl: '' };
-    }
-
-    function isExcluded(el) {
-        for (const sel of CAT_SELECTORS.excludeAreas) {
-            if (el.closest(sel)) return true;
+    // Check if element is in header/footer/sidebar
+    function isChrome(el) {
+        const chromeSelectors = [
+            'header', 'footer', 'nav',
+            '[class*="header"]', '[class*="footer"]',
+            '[class*="sidebar"]', '[class*="nav-"]',
+            '[data-widget="header"]', '[data-widget="footer"]',
+            '#__next > div:first-child', // Next.js default wrapper
+        ];
+        for (const sel of chromeSelectors) {
+            try {
+                if (sel.startsWith('#') && el.id === sel.slice(1)) return true;
+                if (el.closest(sel)) return true;
+            } catch (e) { /* ignore */ }
         }
         return false;
     }
 
+    // Find the nearest ancestor heading element (h1-h6) or heading-like div
+    function findNearestHeading(el) {
+        // Walk up DOM looking for h1-h6
+        let current = el.parentElement;
+        let found = null;
+        while (current && current !== document.body) {
+            // Check h1-h6
+            const h = current.querySelector('h1, h2, h3, h4, h5, h6');
+            if (h) {
+                // Verify the heading is ABOVE this element in the DOM, not inside it
+                const pos = h.compareDocumentPosition(el);
+                if (pos & Node.DOCUMENT_POSITION_FOLLOWING) {
+                    found = h;
+                    // Keep walking up to find a higher-level heading
+                }
+            }
+            current = current.parentElement;
+        }
+        return found;
+    }
+
+    // Find the nearest previous heading (sibling or ancestor's previous sibling)
+    function findPreviousHeading(el) {
+        // Walk backwards through siblings, then up
+        let node = el.previousSibling;
+        while (node) {
+            if (node.nodeType === 1) {
+                const tag = node.tagName;
+                if (tag && /^H[1-6]$/.test(tag)) return node;
+                const inner = node.querySelector('h1, h2, h3, h4, h5, h6');
+                if (inner) return inner;
+            }
+            node = node.previousSibling;
+        }
+        // If no previous sibling heading, check parent
+        if (el.parentElement) {
+            return findPreviousHeading(el.parentElement) || findNearestHeading(el);
+        }
+        return null;
+    }
+
+    // Find all preceding text that looks like a section title before this element
+    function findSectionTitle(el) {
+        // Strategy: look at the parent container, find text elements before this one
+        const parent = el.closest('section, article, div[class*="grid"], div[class*="categ"], div[class*="list"]') || el.parentElement;
+        if (!parent) return '';
+
+        const children = Array.from(parent.children);
+        const idx = children.indexOf(el.closest('div, a, li') || el);
+        if (idx <= 0) return '';
+
+        // Look backwards for heading-like elements
+        for (let i = idx - 1; i >= 0; i--) {
+            const child = children[i];
+            const tag = child.tagName;
+            if (tag && /^H[1-6]$/.test(tag)) return safeText(child);
+            // Check for div that looks like heading (bold, larger font, title class)
+            const txt = safeText(child);
+            if (txt && txt.length > 1 && txt.length < 80) {
+                const style = window.getComputedStyle(child);
+                const fw = parseInt(style.fontWeight) || 400;
+                const fs = parseFloat(style.fontSize) || 14;
+                const isHeadingLike = (
+                    fw >= 600 || fs >= 16 ||
+                    /title|heading|header|caption/i.test(child.className || '')
+                );
+                if (isHeadingLike && !child.querySelector('a')) return txt;
+            }
+        }
+        return '';
+    }
+
     // ============================================================
-    // IndexedDB Storage — Categories
+    // Category Detection: is this link a category (not a product)?
     // ============================================================
-    const DB_NAME = 'OzonCatDB';
+    function isCategoryLink(link) {
+        const href = (link.getAttribute('href') || '').toLowerCase();
+        const text = safeText(link).toLowerCase();
+
+        // Must have content
+        if (!text || text.length < 2) return false;
+        if (text.length > 100) return false; // Too long = product name
+
+        // Product pages: /product/xxx/
+        if (/\/product\//.test(href)) return false;
+
+        // Category pages
+        if (/\/category\//.test(href)) return true;
+
+        // Catalog/collection pages
+        if (/\/(catalog|collection|tag|brand)\//.test(href)) return true;
+
+        // Search/category filter pages (Ozon often links to search with category filter)
+        if (/\/search\/.*category/.test(href)) return true;
+        if (/\/category/.test(href)) return true;
+
+        // Non-category stuff
+        if (/\/seller\//.test(href)) return false;
+        if (/\/my\//.test(href)) return false;
+        if (/\/cart\//.test(href)) return false;
+        if (/\/checkout\//.test(href)) return false;
+        if (/\/info\//.test(href)) return false;
+        if (href === '/' || href === '') return false;
+        if (/^https?:\/\//.test(href) && !/ozon\.ru/.test(href)) return false;
+
+        // For pages with category-like URL structure but no /category/ prefix
+        // e.g., /electronika/ or /bytovaya-tehnika/
+        if (href.match(/^\/[a-zа-яё-]+\/\d*\/?$/) || href.match(/^\/[a-zа-яё-]+-[a-zа-яё-]+\/\d*\/?$/)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    // ============================================================
+    // Scraping Engine: Hierarchical Category Extraction
+    // ============================================================
+    function scrapeAllCategories() {
+        const L1 = getL1Category();
+        const allLinks = Array.from(document.querySelectorAll('a'));
+
+        // Filter: category links in main content area
+        const catLinks = allLinks.filter(link => {
+            if (isChrome(link)) return false;
+            return isCategoryLink(link);
+        });
+
+        console.log('[OzonCat] Raw category links found:', catLinks.length);
+
+        // ============================================================
+        // Strategy 1: Find tab/button bar for L2
+        // ============================================================
+        let l2Items = [];
+        const tabBarCandidate = findTabBar();
+        if (tabBarCandidate) {
+            const tabs = tabBarCandidate.querySelectorAll('a, button, [role="tab"], [role="button"]');
+            for (const tab of tabs) {
+                const text = safeText(tab);
+                if (text && text.length >= 2 && text.length < 60) {
+                    const href = tab.getAttribute('href') || tab.closest('a')?.getAttribute('href') || '';
+                    l2Items.push({ name: text, url: href, level: 2 });
+                }
+            }
+        }
+
+        // Strategy 2: If no tab bar, use URL structure to find L2
+        if (l2Items.length === 0) {
+            // Top-level category links (direct children of main content)
+            l2Items = catLinks
+                .filter(l => {
+                    const href = l.getAttribute('href') || '';
+                    return /\/category\//.test(href) && !/\/category\/[^/]+\//.test(href.replace(/\/$/, ''));
+                })
+                .map(l => ({ name: safeText(l), url: l.getAttribute('href') || '', level: 2 }))
+                .slice(0, 20);
+        }
+
+        // Deduplicate L2
+        const seen2 = new Set();
+        l2Items = l2Items.filter(item => {
+            const key = item.name.trim();
+            if (seen2.has(key)) return false;
+            seen2.add(key);
+            return true;
+        });
+
+        // ============================================================
+        // Strategy 3: Find sections with headings (L3) and their children (L4)
+        // ============================================================
+        // Group remaining links by their section context
+        const sections = [];
+
+        // Find all heading-like elements in the main content
+        const headings = findAllHeadings();
+
+        for (const h of headings) {
+            const title = safeText(h);
+            if (!title || title.length < 2 || title.length > 80) continue;
+            if (/купить|корзина|избран|цена|скидк|фильтр|сортир|показать|страниц/i.test(title)) continue;
+
+            // Find links that belong to this section
+            const sectionLinks = [];
+            let current = h.nextElementSibling;
+            let safety = 0;
+
+            while (current && safety < 200) {
+                safety++;
+                // Stop at next heading
+                if (current.tagName && /^H[1-4]$/.test(current.tagName)) break;
+
+                // Collect links
+                const links = current.querySelectorAll('a');
+                for (const l of links) {
+                    if (isChrome(l)) continue;
+                    if (!isCategoryLink(l) && !/\/product\//.test(l.getAttribute('href') || '')) continue;
+                    const text = safeText(l);
+                    if (text && text.length >= 2 && text.length < 120) {
+                        const href = l.getAttribute('href') || '';
+                        sectionLinks.push({ name: text, url: href });
+                    }
+                }
+
+                current = current.nextElementSibling;
+            }
+
+            if (sectionLinks.length > 0) {
+                sections.push({ title, links: sectionLinks });
+            }
+        }
+
+        // ============================================================
+        // Strategy 4: DOM position-based grouping (fallback)
+        // ============================================================
+        if (sections.length === 0) {
+            // Group by parent container
+            const groups = new Map();
+            for (const link of catLinks) {
+                // Find the section container
+                const section = link.closest(
+                    'section, article, [class*="group"], [class*="block"], [class*="row"], [class*="col"]'
+                ) || link.parentElement;
+                if (!section) continue;
+
+                const sectionKey = section.className || section.tagName;
+                if (!groups.has(sectionKey)) groups.set(sectionKey, []);
+                groups.get(sectionKey).push({ name: safeText(link), url: link.getAttribute('href') || '' });
+            }
+
+            for (const [key, links] of groups) {
+                if (links.length >= 2) {
+                    // Find title for this group
+                    let title = '';
+                    const container = document.querySelector('.' + key.split(' ')[0]) ||
+                                    document.querySelector(key);
+                    if (container) {
+                        const h = container.querySelector('h2, h3, h4, h5');
+                        if (h) title = safeText(h);
+                    }
+                    if (!title) {
+                        // Use first link parent's section context
+                        title = findSectionTitle(links[0].el);
+                    }
+                    if (title && links.length > 0) {
+                        sections.push({ title, links });
+                    }
+                }
+            }
+        }
+
+        // Deduplicate L3 sections by title
+        const seen3 = new Set();
+        const dedupedSections = sections.filter(s => {
+            const key = s.title.trim();
+            if (seen3.has(key)) return false;
+            seen3.add(key);
+            return s.links.length > 0;
+        });
+
+        return {
+            l1: L1,
+            l2: l2Items,
+            l3and4: dedupedSections,
+            rawCount: catLinks.length,
+        };
+    }
+
+    function getL1Category() {
+        const path = location.pathname;
+
+        // Breadcrumb approach
+        const breadLinks = document.querySelectorAll(
+            'a[href*="/category/"], [class*="bread"] a, [data-widget*="bread"] a, nav[aria-label] a'
+        );
+        const crumbs = [];
+        for (const b of breadLinks) {
+            const t = safeText(b);
+            if (t && t.length > 1 && t.length < 80) crumbs.push(t);
+        }
+
+        if (crumbs.length > 0) {
+            // The deepest breadcrumb that's not the current page
+            return crumbs[crumbs.length - 1];
+        }
+
+        // URL approach
+        if (/\/category\//.test(path)) {
+            const m = path.match(/\/category\/([^/]+)/);
+            if (m) {
+                return m[1].replace(/-/g, ' ').replace(/\d+/g, '').trim();
+            }
+        }
+
+        // Page title fallback
+        const h1 = document.querySelector('h1');
+        if (h1) return safeText(h1);
+
+        return 'Все категории';
+    }
+
+    function findTabBar() {
+        // Look for horizontal scrollable container with category links
+        const candidates = document.querySelectorAll(
+            '[class*="tabs"], [class*="tab"], [class*="catalogNav"], [class*="catNav"], ' +
+            '[class*="subcat"], [class*="submenu"], [class*="pill"], [class*="chip"], ' +
+            '[class*="scroll"]'
+        );
+
+        for (const c of candidates) {
+            const style = window.getComputedStyle(c);
+            const links = c.querySelectorAll('a');
+            // Must have multiple links and be a horizontal container
+            if (links.length >= 3 && (style.display === 'flex' || style.overflowX === 'auto' || style.overflowX === 'scroll')) {
+                // Verify links point to categories
+                let catCount = 0;
+                for (const l of links) {
+                    if (isCategoryLink(l) || /\/category\//.test(l.getAttribute('href') || '')) catCount++;
+                }
+                if (catCount >= 2) return c;
+            }
+        }
+
+        // Fallback: find any flex container with category links
+        const flexContainers = document.querySelectorAll('[style*="display: flex"], [style*="display:flex"]');
+        for (const c of flexContainers) {
+            const links = c.querySelectorAll('a[href*="/category/"]');
+            if (links.length >= 3) return c;
+        }
+
+        return null;
+    }
+
+    function findAllHeadings() {
+        // Find all h1-h6 elements in main content (excluding chrome)
+        const hs = document.querySelectorAll('h1, h2, h3, h4, h5, h6');
+        const result = [];
+        for (const h of hs) {
+            if (!isChrome(h)) result.push(h);
+        }
+
+        // If no headings found, look for heading-like divs
+        if (result.length === 0) {
+            const headingLike = document.querySelectorAll(
+                '[class*="title"], [class*="heading"], [class*="header"], ' +
+                '[class*="section-name"], [class*="group-title"]'
+            );
+            for (const h of headingLike) {
+                if (!isChrome(h) && !h.querySelector('a[href]')) result.push(h);
+            }
+        }
+
+        return result;
+    }
+
+    // ============================================================
+    // IndexedDB Storage
+    // ============================================================
+    const DB_NAME = 'OzonCatTreeV4';
     const STORE_NAME = 'categories';
     let dbInstance = null;
 
@@ -140,10 +437,7 @@
             req.onupgradeneeded = (e) => {
                 const db = e.target.result;
                 if (!db.objectStoreNames.contains(STORE_NAME)) {
-                    const store = db.createObjectStore(STORE_NAME, { keyPath: 'id' });
-                    store.createIndex('slug', 'slug', { unique: true });
-                    store.createIndex('level', 'level', { unique: false });
-                    store.createIndex('parentUrl', 'parentUrl', { unique: false });
+                    db.createObjectStore(STORE_NAME, { keyPath: 'id' });
                 }
             };
             req.onsuccess = (e) => { dbInstance = e.target.result; resolve(dbInstance); };
@@ -151,164 +445,38 @@
         });
     }
 
-    async function saveCategory(cat) {
+    // Save a batch of categories (replace all for current level)
+    async function saveBatch(items) {
         const db = await initDB();
         return new Promise((resolve, reject) => {
             const tx = db.transaction(STORE_NAME, 'readwrite');
             const store = tx.objectStore(STORE_NAME);
-            // Use slug as dedup key — update if exists
-            const idx = store.index('slug');
-            const getReq = idx.getKey(cat.slug);
-            getReq.onsuccess = () => {
-                if (getReq.result) {
-                    // Update existing
-                    cat.id = getReq.result;
-                }
-                const putReq = store.put(cat);
-                putReq.onsuccess = () => resolve();
-                putReq.onerror = (e) => reject(e.target.error);
-            };
-            getReq.onerror = () => {
-                // If index doesn't work, just put
-                const putReq = store.put(cat);
-                putReq.onsuccess = () => resolve();
-                putReq.onerror = (e) => reject(e.target.error);
-            };
+            for (const item of items) {
+                store.put(item);
+            }
+            tx.oncomplete = () => resolve();
+            tx.onerror = (e) => reject(e.target.error);
         });
     }
 
-    async function getAllCategories() {
+    async function getAll() {
         const db = await initDB();
-        return new Promise((resolve, reject) => {
+        return new Promise((resolve) => {
             const tx = db.transaction(STORE_NAME, 'readonly');
             const store = tx.objectStore(STORE_NAME);
             const req = store.getAll();
-            req.onsuccess = () => {
-                const results = req.result || [];
-                // Sort by level then name
-                results.sort((a, b) => {
-                    if (a.level !== b.level) return a.level - b.level;
-                    return (a.name || '').localeCompare(b.name || '');
-                });
-                resolve(results);
-            };
-            req.onerror = (e) => reject(e.target.error);
+            req.onsuccess = () => resolve(req.result || []);
         });
     }
 
-    async function countCategories() {
+    async function clearAll() {
         const db = await initDB();
-        return new Promise((resolve, reject) => {
-            const tx = db.transaction(STORE_NAME, 'readonly');
-            const store = tx.objectStore(STORE_NAME);
-            const req = store.count();
-            req.onsuccess = () => resolve(req.result);
-            req.onerror = (e) => reject(e.target.error);
-        });
-    }
-
-    async function clearAllCategories() {
-        const db = await initDB();
-        return new Promise((resolve, reject) => {
+        return new Promise((resolve) => {
             const tx = db.transaction(STORE_NAME, 'readwrite');
             const store = tx.objectStore(STORE_NAME);
-            const req = store.clear();
-            req.onsuccess = () => resolve();
-            req.onerror = (e) => reject(e.target.error);
+            store.clear();
+            tx.oncomplete = () => resolve();
         });
-    }
-
-    // ============================================================
-    // Category Scraping Engine
-    // ============================================================
-    function scrapeCategories() {
-        const currentLevel = getCurrentLevel();
-        const { parentName, parentUrl } = getParentInfo();
-        const now = new Date().toISOString();
-        const currentPageUrl = location.pathname + location.search;
-        const scraped = [];
-        const seen = new Set();
-
-        // Strategy: Find category links, excluding header/footer nav
-        const allCatLinks = document.querySelectorAll('a[href*="/category/"]');
-
-        console.log('[OzonCat] Found', allCatLinks.length, 'total category links on page');
-
-        for (const link of allCatLinks) {
-            const href = link.getAttribute('href') || '';
-            const slug = extractSlug(href);
-            if (!slug) continue;
-
-            // Skip duplicates (same slug)
-            if (seen.has(slug)) continue;
-            seen.add(slug);
-
-            // Skip excluded areas
-            if (isExcluded(link)) continue;
-
-            // Skip current page link (self-referencing)
-            if (href === currentPageUrl || href === location.pathname) continue;
-
-            // Skip utility links (back to all categories, etc.)
-            const text = safeText(link).toLowerCase();
-            if (text === 'все категории' || text === 'назад' || text === 'all categories') continue;
-            if (!text || text.length < 2) continue;
-
-            // Find the parent card/container for more context
-            const card = link.closest('[class*="widget"], [class*="tile"], [class*="card"], [class*="item"], [class*="cell"]');
-
-            // Try to get image
-            let imageUrl = '';
-            if (card) {
-                const img = card.querySelector('img');
-                if (img) imageUrl = img.src || img.getAttribute('data-src') || '';
-            }
-
-            // Try to count children — look for nested category links inside this card
-            let childrenCount = 0;
-            if (card) {
-                childrenCount = card.querySelectorAll('a[href*="/category/"]').length - 1; // exclude self
-            }
-
-            const cat = {
-                id: generateId(),
-                name: text,
-                url: href,
-                fullUrl: buildUrl(href),
-                slug: slug,
-                level: currentLevel + 1, // child of current page
-                parentUrl: parentUrl || currentPageUrl,
-                parentName: parentName || 'Все категории',
-                imageUrl: imageUrl,
-                childrenCount: Math.max(0, childrenCount),
-                scrapedAt: now,
-            };
-
-            scraped.push(cat);
-        }
-
-        // ============================================================
-        // Post-filtering: remove nav-like duplicates
-        // Filter out links that look like they came from the global nav
-        // by keeping only those inside main content widgets/cards
-        // ============================================================
-
-        // If we found cards with widget containers, prioritize those
-        const fromCards = scraped.filter(c => c.childrenCount > 0 || c.imageUrl);
-        const result = fromCards.length > 0 ? fromCards : scraped;
-
-        // Deduplicate by name within same level
-        const deduped = [];
-        const nameSeen = new Set();
-        for (const c of result) {
-            const key = c.level + '|' + c.name;
-            if (!nameSeen.has(key)) {
-                nameSeen.add(key);
-                deduped.push(c);
-            }
-        }
-
-        return deduped;
     }
 
     // ============================================================
@@ -335,9 +503,6 @@
         });
     }
 
-    // ============================================================
-    // Export Functions
-    // ============================================================
     function downloadBlob(content, filename, mime) {
         const blob = content instanceof Blob ? content : new Blob([content], { type: mime || 'text/plain' });
         const url = URL.createObjectURL(blob);
@@ -348,366 +513,399 @@
         setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 1000);
     }
 
+    // ============================================================
+    // Export: Markdown
+    // ============================================================
+    async function exportMarkdown() {
+        const all = await getAll();
+        if (all.length === 0) {
+            alert('没有数据！请先在类目页点击"采集本页"。');
+            return;
+        }
+
+        // Group by level
+        const l1Items = all.filter(c => c.level === 1);
+        const l2Items = all.filter(c => c.level === 2);
+        const l3Items = all.filter(c => c.level === 3);
+        const l4Items = all.filter(c => c.level === 4);
+
+        let md = '# Ozon 类目树\n\n';
+        md += '> 采集时间: ' + new Date().toISOString() + '\n';
+        md += '> 来源: ' + location.origin + '\n';
+        md += '> 总计: ' + all.length + ' 条类目\n\n';
+        md += '---\n\n';
+
+        // L1 → L2 → L3 → L4 hierarchy
+        if (l1Items.length > 0) {
+            for (const l1 of l1Items) {
+                md += '## ' + (l1.emoji || '📁') + ' ' + l1.name + '\n\n';
+                md += l1.url ? '> ' + buildUrl(l1.url) + '\n\n' : '\n';
+
+                // Find L2 items under this L1
+                const children2 = l2Items.filter(c => c.parent === l1.name);
+                for (const l2 of children2) {
+                    md += '### ' + (l2.emoji || '📂') + ' ' + l2.name + '\n\n';
+                    md += l2.url ? '> ' + buildUrl(l2.url) + '\n\n' : '\n';
+
+                    // Find L3 items under this L2
+                    const children3 = l3Items.filter(c => c.parent === l2.name);
+                    for (const l3 of children3) {
+                        md += '#### ' + (l3.emoji || '📋') + ' ' + l3.name + '\n\n';
+                        md += l3.url ? '> ' + buildUrl(l3.url) + '\n\n' : '\n';
+
+                        // Find L4 items under this L3
+                        const children4 = l4Items.filter(c => c.parent === l3.name);
+                        for (const l4 of children4) {
+                            md += '- **' + l4.name + '**';
+                            md += l4.url ? ' — [' + buildUrl(l4.url) + '](' + buildUrl(l4.url) + ')' : '';
+                            md += '\n';
+                        }
+                        md += '\n';
+                    }
+                }
+            }
+        } else {
+            // Flat export with level indicators
+            md += '## 📊 按层级分类\n\n';
+            for (let lv = 1; lv <= 4; lv++) {
+                const items = all.filter(c => c.level === lv);
+                if (items.length === 0) continue;
+                md += '### ' + ['', '一级类目', '二级类目', '三级类目', '四级类目'][lv] + ' (' + items.length + '个)\n\n';
+                for (const item of items) {
+                    md += '- **' + item.name + '**';
+                    if (item.parent) md += ' ← ' + item.parent;
+                    if (item.url) md += ' [' + buildUrl(item.url) + '](' + buildUrl(item.url) + ')';
+                    md += '\n';
+                }
+                md += '\n';
+            }
+        }
+
+        // Stats footer
+        md += '---\n\n';
+        md += '## 📈 统计\n\n';
+        md += '| 层级 | 数量 |\n| --- | --- |\n';
+        md += '| 一级 | ' + l1Items.length + ' |\n';
+        md += '| 二级 | ' + l2Items.length + ' |\n';
+        md += '| 三级 | ' + l3Items.length + ' |\n';
+        md += '| 四级 | ' + l4Items.length + ' |\n';
+        md += '| **合计** | **' + all.length + '** |\n';
+
+        downloadBlob(md, 'ozon-category-tree-' + Date.now() + '.md', 'text/markdown;charset=utf-8');
+        showMsg('Markdown 导出完成！共 ' + all.length + ' 条', 'ok');
+    }
+
+    // ============================================================
+    // Export: CSV
+    // ============================================================
     async function exportCSV() {
-        const cats = await getAllCategories();
-        if (cats.length === 0) {
-            alert('没有数据可导出！请先在类目页面点击"开始采集"。');
+        const all = await getAll();
+        if (all.length === 0) {
+            alert('没有数据！请先在类目页点击"采集本页"。');
             return;
         }
         const BOM = '\uFEFF';
-        const h = ['层级','类目名','完整路径','父类目','URL','子类目数','抓取时间'];
-        const rows = cats.map(c => {
-            const fullPath = c.parentName && c.parentName !== 'Все категории'
-                ? c.parentName + ' > ' + c.name
-                : c.name;
+        const h = ['层级','类目名','完整路径','父类目','URL','采集时间'];
+        const rows = all.map(c => {
+            const path = c.path || c.name;
             return [
                 c.level || '',
                 '"' + (c.name || '').replace(/"/g, '""') + '"',
-                '"' + (fullPath || '').replace(/"/g, '""') + '"',
-                '"' + (c.parentName || '').replace(/"/g, '""') + '"',
-                c.fullUrl || '',
-                c.childrenCount ?? '',
+                '"' + (path || '').replace(/"/g, '""') + '"',
+                '"' + (c.parent || '').replace(/"/g, '""') + '"',
+                c.url ? buildUrl(c.url) : '',
                 c.scrapedAt || '',
             ].join(',');
         });
         downloadBlob(BOM + h.join(',') + '\n' + rows.join('\n'), 'ozon-categories-' + Date.now() + '.csv', 'text/csv;charset=utf-8');
-        showMsg('CSV 导出完成！共 ' + cats.length + ' 条类目', 'ok');
+        showMsg('CSV 导出完成！共 ' + all.length + ' 条', 'ok');
     }
 
     async function exportExcel() {
-        const cats = await getAllCategories();
-        if (cats.length === 0) {
-            alert('没有数据可导出！请先在类目页面点击"开始采集"。');
+        const all = await getAll();
+        if (all.length === 0) {
+            alert('没有数据！请先在类目页点击"采集本页"。');
             return;
         }
         if (typeof XLSX === 'undefined') {
-            showMsg('正在加载 Excel 库...', 'info');
+            showMsg('加载 Excel 库...', 'info');
             const ok = await loadSheetJS();
-            if (!ok) { showMsg('Excel 库加载失败，请用 CSV 导出', 'err'); return; }
+            if (!ok) { showMsg('Excel 库加载失败，请用 CSV', 'err'); return; }
         }
-        const data = cats.map(c => ({
+        const data = all.map(c => ({
             '层级': c.level || '',
             '类目名': c.name || '',
-            '完整路径': (c.parentName && c.parentName !== 'Все категории' ? c.parentName + ' > ' + c.name : c.name),
-            '父类目': c.parentName || '',
-            'URL': c.fullUrl || '',
-            '子类目数': c.childrenCount ?? '',
-            '抓取时间': c.scrapedAt || '',
+            '完整路径': c.path || c.name,
+            '父类目': c.parent || '',
+            'URL': c.url ? buildUrl(c.url) : '',
+            '采集时间': c.scrapedAt || '',
         }));
         const ws = XLSX.utils.json_to_sheet(data);
-        // Auto-fit column widths
-        const colWidths = [
-            { wch: 6 },   // 层级
-            { wch: 35 },  // 类目名
-            { wch: 50 },  // 完整路径
-            { wch: 30 },  // 父类目
-            { wch: 60 },  // URL
-            { wch: 10 },  // 子类目数
-            { wch: 22 },  // 抓取时间
-        ];
-        ws['!cols'] = colWidths;
+        ws['!cols'] = [{wch:6},{wch:35},{wch:50},{wch:30},{wch:60},{wch:22}];
         const wb = XLSX.utils.book_new();
         XLSX.utils.book_append_sheet(wb, ws, 'Ozon类目');
         const buf = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
-        downloadBlob(new Blob([buf], { type: 'application/octet-stream' }), 'ozon-categories-' + Date.now() + '.xlsx');
-        showMsg('Excel 导出完成！共 ' + cats.length + ' 条类目', 'ok');
+        downloadBlob(new Blob([buf]), 'ozon-categories-' + Date.now() + '.xlsx');
+        showMsg('Excel 导出完成！共 ' + all.length + ' 条', 'ok');
     }
 
     // ============================================================
-    // UI: Panel CSS
+    // UI: Panel
     // ============================================================
     const CSS = `
-#oz-scraper {
-    position: fixed; top: 10px; right: 10px; z-index: 2147483647;
-    width: 280px;
-    background: #1a1a2e; color: #e0e0e0;
-    border-radius: 10px; box-shadow: 0 4px 24px rgba(0,0,0,0.6);
-    font: 12px/1.5 -apple-system, BlinkMacSystemFont, sans-serif;
-    border: 1px solid #333;
-    user-select: none;
-}
-.oz-head {
-    display: flex; align-items: center; padding: 6px 10px;
-    background: #252540; border-radius: 10px 10px 0 0; border-bottom: 1px solid #333;
-    cursor: grab; gap: 6px;
-}
-.oz-head:active { cursor: grabbing; }
-.oz-head .oz-logo {
-    width: 20px; height: 20px; border-radius: 4px;
-    background: linear-gradient(135deg, #667eea, #764ba2);
-    display: flex; align-items: center; justify-content: center;
-    font-size: 11px; flex-shrink: 0; color: #fff;
-}
-.oz-head .oz-title { flex: 1; font-weight: 700; color: #cdd6f4; font-size: 12px; letter-spacing: 0.3px; }
-.oz-head .oz-btn-close {
-    background: none; border: none; color: #888; cursor: pointer;
-    font-size: 14px; padding: 0 3px; line-height: 1;
-}
-.oz-head .oz-btn-close:hover { color: #f38ba8; }
-.oz-body { padding: 10px; display: flex; flex-direction: column; gap: 8px; }
-.oz-stat {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 6px 8px; background: #252540; border-radius: 6px;
-    font-size: 11px;
-}
-.oz-stat .oz-count { font-weight: 700; color: #89b4fa; font-size: 14px; }
-.oz-stat .oz-status { font-size: 10px; padding: 2px 6px; border-radius: 8px; }
-.oz-stat .oz-status.idle { background: #333; color: #888; }
-.oz-stat .oz-status.running { background: #1a3a1a; color: #a6e3a1; animation: oz-pulse 1s infinite; }
-@keyframes oz-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.6; } }
-.oz-info {
-    font-size: 10px; color: #6c7086; padding: 2px 4px;
-    background: #11111b; border-radius: 4px; text-align: center;
-}
-.oz-btn-row { display: flex; gap: 5px; }
-.oz-btn {
-    flex: 1; padding: 10px 8px; border: none; border-radius: 8px;
-    cursor: pointer; font-size: 13px; font-weight: 600; text-align: center;
-    transition: opacity 0.15s, transform 0.1s;
-}
-.oz-btn:active { transform: scale(0.97); }
-.oz-btn:disabled { opacity: 0.35; cursor: not-allowed; }
-.oz-btn-start { background: #89b4fa; color: #1a1a2e; }
-.oz-btn-stop  { background: #f38ba8; color: #1a1a2e; }
-.oz-btn-csv   { background: #45475a; color: #cdd6f4; font-size: 11px; padding: 6px 8px; }
-.oz-btn-xlsx  { background: #a6e3a1; color: #1a1a2e; font-size: 11px; padding: 6px 8px; }
-.oz-btn-clear { background: none; border: 1px solid #45475a; color: #888; font-size: 10px; padding: 6px 8px; border-radius: 6px; cursor: pointer; margin-top: 2px; }
-.oz-btn-clear:hover { color: #f38ba8; border-color: #f38ba8; }
-.oz-log {
-    max-height: 200px; overflow-y: auto; font-size: 10px;
-    background: #11111b; border-radius: 6px; padding: 6px;
-    color: #6c7086; line-height: 1.4;
-    display: none;
-}
-.oz-log.show { display: block; }
-.oz-log .oz-log-item { padding: 1px 0; border-bottom: 1px solid #1a1a2e; }
-.oz-msg {
-    position: fixed; top: 10px; left: 50%; transform: translateX(-50%);
-    padding: 8px 18px; border-radius: 8px; font-size: 13px; z-index: 2147483648;
-    box-shadow: 0 2px 12px rgba(0,0,0,0.5); pointer-events: none;
-    animation: oz-fade 2.5s ease forwards;
-}
-.oz-msg.ok  { background: #a6e3a1; color: #1a1a2e; }
-.oz-msg.err { background: #f38ba8; color: #1a1a2e; }
-.oz-msg.info { background: #89b4fa; color: #1a1a2e; }
-@keyframes oz-fade { 0% { opacity: 0; top: 20px; } 15% { opacity: 1; top: 10px; } 80% { opacity: 1; top: 10px; } 100% { opacity: 0; top: 0; } }
+#oz-scraper{position:fixed;top:10px;right:10px;z-index:2147483647;width:300px;background:#1a1a2e;color:#cdd6f4;border-radius:10px;box-shadow:0 4px 24px rgba(0,0,0,.6);font:12px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;border:1px solid #313244;user-select:none;}
+.oz-hd{display:flex;align-items:center;padding:7px 10px;background:#1e1e2e;border-radius:10px 10px 0 0;border-bottom:1px solid #313244;cursor:grab;gap:6px}
+.oz-hd:active{cursor:grabbing}
+.oz-lg{width:22px;height:22px;border-radius:5px;background:linear-gradient(135deg,#667eea,#cba6f7);display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0;color:#1a1a2e;font-weight:700}
+.oz-tt{flex:1;font-weight:700;font-size:12px;letter-spacing:.3px}
+.oz-cl{background:0;border:0;color:#585b70;cursor:pointer;font-size:15px;padding:0 3px;line-height:1}
+.oz-cl:hover{color:#f38ba8}
+.oz-bd{padding:10px;display:flex;flex-direction:column;gap:7px}
+.oz-st{display:flex;align-items:center;justify-content:space-between;padding:6px 8px;background:#181825;border-radius:6px;font-size:11px}
+.oz-nm{font-weight:700;color:#89b4fa;font-size:15px;min-width:20px;text-align:center}
+.oz-lb{font-size:8px;padding:2px 6px;border-radius:8px;text-transform:uppercase;letter-spacing:.5px}
+.oz-lb.idle{background:#313244;color:#6c7086}
+.oz-lb.run{background:#1a3a1a;color:#a6e3a1;animation:oz-p .8s infinite}
+@keyframes oz-p{0%,100%{opacity:1}50%{opacity:.5}}
+.oz-inf{font-size:10px;color:#6c7086;padding:3px 6px;background:#11111b;border-radius:4px;text-align:center;line-height:1.5}
+.oz-br{display:flex;gap:4px}
+.oz-bt{flex:1;padding:9px 6px;border:0;border-radius:7px;cursor:pointer;font-size:12px;font-weight:600;text-align:center;transition:transform .1s}
+.oz-bt:active{transform:scale(.96)}
+.oz-bt:disabled{opacity:.25;cursor:not-allowed}
+.oz-scan{background:#89b4fa;color:#1a1a2e}
+.oz-stop{background:#f38ba8;color:#1a1a2e}
+.oz-csv{background:#45475a;color:#cdd6f4;font-size:10px;padding:5px}
+.oz-xls{background:#a6e3a1;color:#1a1a2e;font-size:10px;padding:5px}
+.oz-md{background:#fab387;color:#1a1a2e;font-size:10px;padding:5px}
+.oz-clr{background:none;border:1px solid #45475a;color:#6c7086;font-size:9px;padding:5px 8px;border-radius:5px;cursor:pointer}
+.oz-clr:hover{color:#f38ba8;border-color:#f38ba8}
+.oz-log{max-height:140px;overflow-y:auto;font-size:9px;background:#11111b;border-radius:6px;padding:5px;color:#585b70;line-height:1.4;display:none;font-family:monospace}
+.oz-log.on{display:block}
+.oz-log i{padding:1px 0;border-bottom:1px solid #181825;display:block}
+.oz-msg{position:fixed;top:10px;left:50%;transform:translateX(-50%);padding:8px 18px;border-radius:8px;font-size:13px;z-index:2147483648;box-shadow:0 2px 12px rgba(0,0,0,.5);pointer-events:none;animation:oz-fd 2.5s ease forwards}
+.oz-msg.ok{background:#a6e3a1;color:#1a1a2e}
+.oz-msg.err{background:#f38ba8;color:#1a1a2e}
+.oz-msg.inf{background:#89b4fa;color:#1a1a2e}
+@keyframes oz-fd{0%{opacity:0;top:20px}15%{opacity:1;top:10px}80%{opacity:1;top:10px}100%{opacity:0;top:0}}
+#oz-scraper .oz-br2{display:flex;gap:4px;margin-top:0}
 `;
 
-    // ============================================================
-    // UI: Toast & Log
-    // ============================================================
-    function showMsg(text, type) {
-        const el = document.createElement('div');
-        el.className = 'oz-msg ' + (type || 'ok');
-        el.textContent = text;
-        document.body.appendChild(el);
-        setTimeout(() => el.remove(), 2600);
+    function showMsg(txt, typ) {
+        const e = document.createElement('div');
+        e.className = 'oz-msg ' + (typ || 'ok');
+        e.textContent = txt;
+        document.body.appendChild(e);
+        setTimeout(() => e.remove(), 2600);
     }
 
-    function addLog(text) {
-        const logEl = document.getElementById('oz-log');
-        if (!logEl) return;
-        logEl.classList.add('show');
-        const item = document.createElement('div');
-        item.className = 'oz-log-item';
-        const time = new Date().toLocaleTimeString();
-        item.textContent = '[' + time + '] ' + text;
-        logEl.insertBefore(item, logEl.firstChild);
-        // Keep max 50 entries
-        while (logEl.children.length > 50) logEl.lastChild.remove();
+    function addLog(txt) {
+        const el = document.getElementById('oz-log');
+        if (!el) return;
+        el.classList.add('on');
+        const i = document.createElement('i');
+        i.textContent = '[' + new Date().toLocaleTimeString() + '] ' + txt;
+        el.prepend(i);
+        while (el.children.length > 80) el.lastChild.remove();
     }
 
-    // ============================================================
-    // UI: Panel Creation
-    // ============================================================
-    let isRunning = false;
-    let observer = null;
     let panelEl = null;
 
-    function updateStatus() {
-        countCategories().then(n => {
-            const cnt = document.getElementById('oz-count');
-            const st = document.getElementById('oz-status');
-            const info = document.getElementById('oz-info');
-            if (cnt) cnt.textContent = n;
-            if (st) {
-                st.textContent = isRunning ? '采集中...' : '待命中';
-                st.className = 'oz-status ' + (isRunning ? 'running' : 'idle');
-            }
-            if (info) {
-                const lvl = getCurrentLevel();
-                const pageLabel = lvl === 1 ? '顶级类目页' : lvl === 2 ? '二级类目页' : '更深层级';
-                info.textContent = '当前: ' + pageLabel + ' | 已采 ' + n + ' 条';
+    function updateUI() {
+        getAll().then(cats => {
+            const cnt = document.getElementById('oz-cnt');
+            const st = document.getElementById('oz-sta');
+            const inf = document.getElementById('oz-inf');
+            if (cnt) cnt.textContent = cats.length;
+            if (st) { st.textContent = '待命中'; st.className = 'oz-lb idle'; }
+            if (inf) {
+                const l1c = cats.filter(c => c.level === 1).length;
+                const l2c = cats.filter(c => c.level === 2).length;
+                const l3c = cats.filter(c => c.level === 3).length;
+                const l4c = cats.filter(c => c.level === 4).length;
+                inf.innerHTML = 'L1:' + l1c + ' L2:' + l2c + ' L3:' + l3c + ' L4:' + l4c;
             }
         }).catch(() => {});
     }
 
     function createPanel() {
         GM_addStyle(CSS);
-
         panelEl = document.createElement('div');
         panelEl.id = 'oz-scraper';
         panelEl.innerHTML = `
-            <div class="oz-head" id="oz-head">
-                <div class="oz-logo">C</div>
-                <div class="oz-title">Ozon 类目采集</div>
-                <button class="oz-btn-close" id="oz-close" title="关闭面板">✕</button>
-            </div>
-            <div class="oz-body">
-                <div class="oz-stat">
-                    <span>已采集</span>
-                    <span class="oz-count" id="oz-count">0</span>
-                    <span>条类目</span>
-                    <span class="oz-status idle" id="oz-status">待命中</span>
-                </div>
-                <div class="oz-info" id="oz-info">当前: -- | 已采 0 条</div>
-                <div class="oz-btn-row">
-                    <button class="oz-btn oz-btn-start" id="oz-start">▶ 采集本页</button>
-                    <button class="oz-btn oz-btn-stop" id="oz-stop" disabled>■ 停止</button>
-                </div>
-                <div class="oz-btn-row">
-                    <button class="oz-btn oz-btn-csv" id="oz-csv">导出 CSV</button>
-                    <button class="oz-btn oz-btn-xlsx" id="oz-xlsx">导出 Excel</button>
-                </div>
-                <button class="oz-btn-clear" id="oz-clear">清空数据</button>
-                <div class="oz-log" id="oz-log"></div>
-            </div>
-        `;
+<div class="oz-hd" id="oz-hd">
+  <div class="oz-lg">O</div>
+  <div class="oz-tt">Ozon 类目采集 v4</div>
+  <button class="oz-cl" id="oz-cl">✕</button>
+</div>
+<div class="oz-bd">
+  <div class="oz-st">
+    <span>已存</span><span class="oz-nm" id="oz-cnt">0</span><span>条</span>
+    <span class="oz-lb idle" id="oz-sta">待命中</span>
+  </div>
+  <div class="oz-inf" id="oz-inf">L1:0 L2:0 L3:0 L4:0</div>
+  <div class="oz-br">
+    <button class="oz-bt oz-scan" id="oz-go">▶ 采集本页</button>
+    <button class="oz-bt oz-stop" id="oz-off" disabled>■ 停</button>
+  </div>
+  <div class="oz-br">
+    <button class="oz-bt oz-csv" id="oz-csv">CSV</button>
+    <button class="oz-bt oz-xls" id="oz-xls">Excel</button>
+    <button class="oz-bt oz-md" id="oz-md">MD文档</button>
+  </div>
+  <button class="oz-clr" id="oz-clr">清空缓存数据</button>
+  <div class="oz-log" id="oz-log"></div>
+</div>`;
         document.body.appendChild(panelEl);
 
-        makeDraggable();
+        // Draggable
+        const hd = document.getElementById('oz-hd');
+        let dx = 0, dy = 0, dr = false;
+        hd.addEventListener('mousedown', e => {
+            if (e.target.id === 'oz-cl') return;
+            dr = true; const r = panelEl.getBoundingClientRect();
+            dx = e.clientX - r.left; dy = e.clientY - r.top;
+            hd.style.cursor = 'grabbing';
+        });
+        document.addEventListener('mousemove', e => {
+            if (!dr) return;
+            const x = Math.max(0, Math.min(e.clientX - dx, innerWidth - panelEl.offsetWidth));
+            const y = Math.max(0, Math.min(e.clientY - dy, innerHeight - panelEl.offsetHeight));
+            panelEl.style.right = 'auto'; panelEl.style.top = y + 'px'; panelEl.style.left = x + 'px';
+        });
+        document.addEventListener('mouseup', () => { if (dr) { dr = false; hd.style.cursor = 'grab'; } });
 
-        document.getElementById('oz-start').addEventListener('click', startScraping);
-        document.getElementById('oz-stop').addEventListener('click', stopScraping);
-        document.getElementById('oz-close').addEventListener('click', () => panelEl.remove());
+        document.getElementById('oz-go').addEventListener('click', scrapeCurrentPage);
+        document.getElementById('oz-off').addEventListener('click', () => {});
+        document.getElementById('oz-cl').addEventListener('click', () => panelEl.remove());
         document.getElementById('oz-csv').addEventListener('click', exportCSV);
-        document.getElementById('oz-xlsx').addEventListener('click', exportExcel);
-        document.getElementById('oz-clear').addEventListener('click', clearData);
+        document.getElementById('oz-xls').addEventListener('click', exportExcel);
+        document.getElementById('oz-md').addEventListener('click', exportMarkdown);
+        document.getElementById('oz-clr').addEventListener('click', clearData);
 
-        updateStatus();
-        window.__ozonScraper = {
-            start: startScraping, stop: stopScraping,
-            exportCSV, exportExcel, clearData,
-            status: () => isRunning,
-            debug: () => {
-                const cats = scrapeCategories();
-                console.table(cats.map(c => ({ name: c.name, level: c.level, parent: c.parentName, slug: c.slug })));
-                return cats;
+        updateUI();
+
+        // Expose debug
+        window.__ozon = {
+            dump: () => {
+                const r = scrapeAllCategories();
+                console.log('=== L1 ===', r.l1);
+                console.log('=== L2 ===', r.l2);
+                console.log('=== L3+L4 SECTIONS ===', r.l3and4.length, 'sections');
+                r.l3and4.forEach((s, i) => {
+                    console.log('  [' + i + '] L3:', s.title, '→', s.links.length, 'L4 items');
+                });
+                return r;
+            },
+            save: async () => { const r = window.__ozon.dump(); await storeResults(r); },
+            cats: getAll,
+            clear: clearAll,
+            allLinks: () => {
+                const links = document.querySelectorAll('a');
+                const result = [];
+                links.forEach((l, i) => {
+                    if (!isChrome(l)) {
+                        result.push({ idx: i, text: safeText(l), href: l.getAttribute('href'), tag: l.outerHTML.substring(0, 120) });
+                    }
+                });
+                console.table(result.slice(0, 50));
+                return result;
             }
         };
     }
 
-    function makeDraggable() {
-        const head = document.getElementById('oz-head');
-        if (!head) return;
-        let offsetX = 0, offsetY = 0, dragging = false;
-
-        head.addEventListener('mousedown', (e) => {
-            if (e.target.id === 'oz-close') return;
-            dragging = true;
-            const rect = panelEl.getBoundingClientRect();
-            offsetX = e.clientX - rect.left;
-            offsetY = e.clientY - rect.top;
-            head.style.cursor = 'grabbing';
-        });
-
-        document.addEventListener('mousemove', (e) => {
-            if (!dragging) return;
-            const x = Math.max(0, Math.min(e.clientX - offsetX, window.innerWidth - panelEl.offsetWidth));
-            const y = Math.max(0, Math.min(e.clientY - offsetY, window.innerHeight - panelEl.offsetHeight));
-            panelEl.style.right = 'auto';
-            panelEl.style.top = y + 'px';
-            panelEl.style.left = x + 'px';
-        });
-
-        document.addEventListener('mouseup', () => {
-            if (dragging) { dragging = false; head.style.cursor = 'grab'; }
-        });
-    }
-
     // ============================================================
-    // Core: Start / Stop / Clear
+    // Scrape + Store
     // ============================================================
-    async function startScraping() {
-        if (isRunning) return;
-        isRunning = true;
+    async function scrapeCurrentPage() {
+        addLog('🔍 扫描中...');
+        showMsg('正在分析页面类目结构...', 'inf');
 
-        const startBtn = document.getElementById('oz-start');
-        const stopBtn = document.getElementById('oz-stop');
-        if (startBtn) startBtn.disabled = true;
-        if (stopBtn) stopBtn.disabled = false;
-        updateStatus();
+        const result = scrapeAllCategories();
+        const now = new Date().toISOString();
+        const items = [];
 
-        showMsg('正在采集当前页面类目...', 'info');
-        addLog('开始采集 ' + location.pathname);
-
-        const cats = scrapeCategories();
-        addLog('发现 ' + cats.length + ' 个类目链接');
-
-        if (cats.length === 0) {
-            addLog('⚠ 未发现类目！当前页面可能不是类目页');
-            showMsg('未发现类目链接！请浏览到 Ozon 类目页面（如 /category/）', 'info');
-        } else {
-            let saved = 0;
-            let skipped = 0;
-            for (const cat of cats) {
-                try {
-                    await saveCategory(cat);
-                    saved++;
-                } catch (e) {
-                    skipped++;
-                }
-            }
-            const lvl = cats[0].level || '?';
-            addLog('保存: ' + saved + ' 条 | 层级: ' + lvl);
-            showMsg('采集完成！保存 ' + saved + ' 条类目 (层级 ' + lvl + ')', 'ok');
+        // L1
+        if (result.l1) {
+            items.push({
+                id: generateId(),
+                name: result.l1,
+                level: 1,
+                parent: '',
+                path: result.l1,
+                url: location.pathname,
+                emoji: '📁',
+                scrapedAt: now,
+            });
         }
 
-        // Auto-stop after one scrape
-        stopScraping(false);
-        updateStatus();
+        // L2
+        for (const item of result.l2) {
+            items.push({
+                id: generateId(),
+                name: item.name,
+                level: 2,
+                parent: result.l1,
+                path: (result.l1 ? result.l1 + ' > ' : '') + item.name,
+                url: item.url,
+                emoji: '📂',
+                scrapedAt: now,
+            });
+        }
 
-        // Start observer to detect navigation to new pages
-        startObserver();
-    }
+        // L3 + L4
+        for (const section of result.l3and4) {
+            const l3item = {
+                id: generateId(),
+                name: section.title,
+                level: 3,
+                parent: result.l2.length > 0 ? result.l2[0]?.name : result.l1,
+                path: (result.l1 ? result.l1 + ' > ' : '') + section.title,
+                url: '',
+                emoji: '📋',
+                scrapedAt: now,
+            };
+            items.push(l3item);
 
-    function stopScraping(showToast = true) {
-        isRunning = false;
-        stopObserver();
-
-        const startBtn = document.getElementById('oz-start');
-        const stopBtn = document.getElementById('oz-stop');
-        if (startBtn) startBtn.disabled = false;
-        if (stopBtn) stopBtn.disabled = true;
-        updateStatus();
-        if (showToast) showMsg('已停止', 'ok');
-    }
-
-    function startObserver() {
-        stopObserver();
-        observer = new MutationObserver(() => {
-            // Detect SPA navigation — URL changed or content replaced
-            const currentPath = location.pathname + location.search;
-            if (window.__oz_last_path && window.__oz_last_path !== currentPath) {
-                window.__oz_last_path = currentPath;
-                addLog('检测到页面切换: ' + currentPath);
-                updateStatus(); // Update level display
+            for (const link of section.links) {
+                // Determine which L2 this L4 belongs to
+                let parentL2 = result.l2.length > 0 ? result.l2[0]?.name : '';
+                items.push({
+                    id: generateId(),
+                    name: link.name,
+                    level: 4,
+                    parent: section.title,
+                    path: (result.l1 ? result.l1 + ' > ' : '') + (parentL2 ? parentL2 + ' > ' : '') + section.title + ' > ' + link.name,
+                    url: link.url,
+                    emoji: '📄',
+                    scrapedAt: now,
+                });
             }
-            window.__oz_last_path = currentPath;
-        });
-        observer.observe(document.body, { childList: true, subtree: true });
-        window.__oz_last_path = location.pathname + location.search;
-    }
+        }
 
-    function stopObserver() {
-        if (observer) { observer.disconnect(); observer = null; }
+        addLog('L1:' + (result.l1 ? '1' : '0') +
+               ' L2:' + result.l2.length +
+               ' L3:' + result.l3and4.length +
+               ' L4:' + result.l3and4.reduce((s, sec) => s + sec.links.length, 0));
+
+        if (items.length === 0) {
+            addLog('⚠ 未提取到类目！');
+            addLog('提示: 打开控制台运行 __ozon.dump() 查看详情');
+            showMsg('未提取到类目数据！打开 F12 控制台运行 __ozon.dump() 调试', 'err');
+            updateUI();
+            return;
+        }
+
+        await saveBatch(items);
+        addLog('✅ 保存 ' + items.length + ' 条');
+        showMsg('采集完成！L1~L4 共 ' + items.length + ' 条', 'ok');
+        updateUI();
     }
 
     async function clearData() {
-        if (!confirm('确定要清空所有已采集的类目数据吗？')) return;
-        await clearAllCategories();
-        addLog('数据已清空');
-        updateStatus();
+        if (!confirm('确定要清空所有已采集的类目数据？')) return;
+        await clearAll();
+        addLog('🗑 数据已清空');
+        updateUI();
         showMsg('数据已清空', 'ok');
     }
 
@@ -717,9 +915,9 @@
     function boot() {
         if (document.getElementById('oz-scraper')) return;
         if (!/ozon\.ru/.test(location.hostname)) return;
-        if (/\/my\//.test(location.pathname) || /\/cart\//.test(location.pathname)) return;
+        if (/\/my\//.test(location.pathname) || /\/cart\//.test(location.pathname) || /\/checkout\//.test(location.pathname)) return;
 
-        console.log('[OzonCat] v3.0.0 boot on', location.href);
+        console.log('[OzonCat] v4.0.0 boot', location.href);
         createPanel();
     }
 
@@ -728,5 +926,4 @@
     } else {
         boot();
     }
-
 })();
