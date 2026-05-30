@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ozon Scraper - 四层类目树 + 俄语转中文
 // @namespace    https://github.com/vision-png/ozon
-// @version      6.0.0
-// @description  采集 Ozon.ru 类目树（L1→L2→L3→L4），导出 CSV/Excel/Markdown（含中文翻译）
+// @version      7.0.0
+// @description  采集 Ozon.ru 类目树（L1-L4），hover触发子菜单展开，导出 CSV/Excel/MD（含中文翻译）
 // @author       Qin Yucheng
 // @match        https://www.ozon.ru/*
 // @match        https://ozon.ru/*
@@ -256,317 +256,445 @@
     }
 
     // ============================================================
-    // 核心：从 Ozon 类目页提取 4 层结构
+    // 核心：模拟 hover 触发子菜单 → 递归采集多层级类目树
+    // Ozon 的 L2/L3/L4 类目是 hover 时才动态渲染的
     // ============================================================
+
+    // 已知的 Ozon 类目 popover 容器特征
+    var POPOVER_SELECTORS = [
+        '[data-widget="catalogMenu"]',
+        '[data-widget="menu"]',
+        '[class*="catalogMenu"]',
+        '[class*="catalog-menu"]',
+        '[class*="subcategory"]',
+        '[class*="sub-category"]',
+        '[class*="dropdown"]',
+        '[class*="popover"]',
+        '[class*="popup"]',
+        '[class*="flyout"]',
+        '[role="menu"]',
+        '[role="tooltip"]',
+        '[data-popper-placement]',
+        '[class*="popper"]',
+        'div[style*="position: fixed"], div[style*="position: absolute"]'
+    ];
+
+    // 类目卡片/入口元素选择器（需要 hover 来展开子类目的元素）
+    var CAT_TRIGGER_SELECTORS = [
+        'a[href*="/category/"]',
+        '[data-widget="categoryItem"]',
+        '[class*="categoryItem"]',
+        '[class*="category-item"]',
+        '[class*="menuItem"]',
+        '[class*="menu-item"]',
+    ];
+
+    function isVisible(el) {
+        if (!el) return false;
+        var r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) return false;
+        var style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+        return true;
+    }
+
+    function isCategoryLink(txt, href) {
+        if (!txt || txt.length < 2 || txt.length > 120) return false;
+        if (!href) return false;
+        var lower = href.toLowerCase();
+        if (/\/product\//.test(lower)) return false;
+        if (/\/seller\//.test(lower)) return false;
+        if (/\/my\//.test(lower)) return false;
+        if (/\/cart\//.test(lower)) return false;
+        if (/\/checkout\//.test(lower)) return false;
+        if (/\/brand\//.test(lower)) return false;
+        if (/\/search\//.test(lower)) return false;
+        // 纯数字类目ID链接也算
+        if (/\/category\//.test(lower)) return true;
+        // /highlight/ 类链接
+        if (/\/highlight\//.test(lower)) return true;
+        return false;
+    }
+
+    // 模拟 hover 事件
+    function simulateHover(el) {
+        var rect = el.getBoundingClientRect();
+        var cx = rect.left + rect.width / 2;
+        var cy = rect.top + rect.height / 2;
+        var opts = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy };
+        el.dispatchEvent(new MouseEvent('mouseenter', opts));
+        el.dispatchEvent(new MouseEvent('mouseover', opts));
+        el.dispatchEvent(new MouseEvent('mousemove', opts));
+        // 也尝试 focus
+        el.dispatchEvent(new Event('focus', { bubbles: true }));
+    }
+
+    // 查找页面上所有 popover/menu 容器
+    function findPopoverContainers() {
+        var containers = [];
+        for (var s = 0; s < POPOVER_SELECTORS.length; s++) {
+            try {
+                var els = document.querySelectorAll(POPOVER_SELECTORS[s]);
+                for (var i = 0; i < els.length; i++) {
+                    if (isVisible(els[i])) containers.push(els[i]);
+                }
+            } catch (e) { /* selector might be invalid */ }
+        }
+        return containers;
+    }
+
+    // 从容器中提取所有类目链接，返回 { name, url, level }
+    function extractLinksFromContainer(container) {
+        var links = [];
+        if (!container) return links;
+        var as = container.querySelectorAll('a');
+        for (var i = 0; i < as.length; i++) {
+            var a = as[i];
+            var txt = safeText(a);
+            var href = a.getAttribute('href') || '';
+            // 跳过嵌套的内层 popover（只取当前容器的直接子节点或浅层链接）
+            if (a.closest('[class*="popover"]') !== container.closest('[class*="popover"]') &&
+                a.closest('[data-popper-placement]') !== container.closest('[data-popper-placement]')) {
+                // 可能是更深层的嵌套 popover，跳过
+                // 但简单起见我们先都收
+            }
+            if (!txt || txt.length < 2 || txt.length > 100) continue;
+            if (!isCategoryLink(txt, href)) continue;
+            // 去重
+            if (!links.some(function(l) { return l.name === txt; })) {
+                links.push({ name: txt, url: href, el: a });
+            }
+        }
+        return links;
+    }
+
+    // 等待 popover 出现（MutationObserver + timeout）
+    function waitForPopover(timeoutMs) {
+        return new Promise(function(resolve) {
+            var startTime = Date.now();
+            var checkInterval = 200;
+            var maxWait = timeoutMs || 1500;
+
+            function check() {
+                var containers = findPopoverContainers();
+                var links = [];
+                for (var c = 0; c < containers.length; c++) {
+                    var cl = extractLinksFromContainer(containers[c]);
+                    links = links.concat(cl);
+                }
+                // 去重
+                var seen = {};
+                var unique = [];
+                for (var l = 0; l < links.length; l++) {
+                    if (!seen[links[l].name]) {
+                        seen[links[l].name] = true;
+                        unique.push(links[l]);
+                    }
+                }
+                if (unique.length > 0) {
+                    resolve(unique);
+                    return;
+                }
+                if (Date.now() - startTime > maxWait) {
+                    resolve([]);
+                    return;
+                }
+                setTimeout(check, checkInterval);
+            }
+            check();
+        });
+    }
+
+    // 记录 popover 出现时的变化，返回找到的链接
+    function watchForChange(el, timeoutMs) {
+        return new Promise(function(resolve) {
+            var resolved = false;
+            var observer = new MutationObserver(function() {
+                if (resolved) return;
+                var containers = findPopoverContainers();
+                var allLinks = [];
+                for (var c = 0; c < containers.length; c++) {
+                    allLinks = allLinks.concat(extractLinksFromContainer(containers[c]));
+                }
+                if (allLinks.length > 0) {
+                    resolved = true;
+                    observer.disconnect();
+                    resolve(allLinks);
+                }
+            });
+            observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class'] });
+            setTimeout(function() {
+                if (!resolved) {
+                    resolved = true;
+                    observer.disconnect();
+                    // 最后再检查一次
+                    var containers = findPopoverContainers();
+                    var allLinks = [];
+                    for (var c = 0; c < containers.length; c++) {
+                        allLinks = allLinks.concat(extractLinksFromContainer(containers[c]));
+                    }
+                    resolve(allLinks);
+                }
+            }, timeoutMs || 2000);
+        });
+    }
+
     async function scrapeCategories() {
-        addLog('开始提取页面类目结构...');
+        addLog('开始扫描类目（含hover展开）...');
         var now = new Date().toISOString();
         var items = [];
         var seen = {};
         var pagePath = location.pathname;
 
         // ========================================================
-        // L1: 当前页面主类目名
+        // L1: 页面主类目名
         // ========================================================
         var l1Name = '';
-        // 方法1: h1
         var h1 = document.querySelector('h1');
         if (h1) l1Name = safeText(h1);
-        // 方法2: 面包屑最后一个
         if (!l1Name) {
-            var bcLinks = document.querySelectorAll('nav[aria-label] a, [class*="breadcrumb"] a, [data-widget*="bread"] a');
+            var bcLinks = document.querySelectorAll('nav[aria-label] a, [class*="breadcrumb"] a');
             if (bcLinks.length > 0) l1Name = safeText(bcLinks[bcLinks.length - 1]);
         }
-        // 方法3: 从 URL slug 提取
         if (!l1Name) {
-            var m = pagePath.match(/\/([a-z0-9\-]+)-(\d+)\/?$/);
+            var m = pagePath.match(/\/category\/([a-z0-9\-]+)-?\d*\/?$/);
             if (m) l1Name = m[1].replace(/-/g, ' ').replace(/\b\w/g, function(c){ return c.toUpperCase(); });
-        }
-        // 方法4: 从 /category/elektronika-15500/ 提取 "elektronika"
-        if (!l1Name) {
-            var m2 = pagePath.match(/\/category\/([a-z0-9\-]+)-?\d*\/?$/);
-            if (m2) l1Name = m2[1].replace(/-/g, ' ').replace(/\b\w/g, function(c){ return c.toUpperCase(); });
         }
 
         if (l1Name) {
             items.push({
                 id: 'l1_' + l1Name.replace(/\s+/g, '_'),
-                name: l1Name,
-                nameZh: translateAll(l1Name),
-                level: 1,
-                parent: '',
-                parentZh: '',
-                url: pagePath,
-                scrapedAt: now
+                name: l1Name, nameZh: translateAll(l1Name),
+                level: 1, parent: '', parentZh: '',
+                url: pagePath, scrapedAt: now
             });
             seen[l1Name + '|1'] = true;
-            addLog('L1: ' + l1Name);
+            addLog('L1: ' + l1Name + ' (' + translateAll(l1Name) + ')');
         }
 
         // ========================================================
-        // L2: 水平标签栏（如 Бытовая техника, Телефоны...）
-        // 特征：靠近顶部，通常是水平排列的 a 标签
+        // 策略A：静态扫描页面主内容区链接（无hover时直接可见的类目）
         // ========================================================
-        var l2Items = [];
-        var l2Seen = {};
-
-        // 策略1: 找 nav/ul/li 结构中的水平导航
-        var tabBars = document.querySelectorAll('ul, nav, [role="tablist"]');
-        for (var t = 0; t < tabBars.length; t++) {
-            var bar = tabBars[t];
-            // 排除明显不是标签栏的
-            if (bar.closest('header, footer, [class*="header"], [class*="footer"]')) continue;
-
-            var links = bar.querySelectorAll(':scope > li > a, :scope > a');
-            if (links.length >= 3 && links.length <= 30) {
-                for (var l = 0; l < links.length; l++) {
-                    var link = links[l];
-                    var txt = safeText(link);
-                    var href = link.getAttribute('href') || '';
-                    if (!txt || txt.length < 2 || txt.length > 80) continue;
-                    if (!href || href === '/' || href === pagePath) continue;
-                    if (/product|seller|my|cart|checkout/.test(href)) continue;
-
-                    if (!l2Seen[txt]) {
-                        l2Seen[txt] = true;
-                        l2Items.push({ name: txt, url: href, el: link });
-                    }
+        addLog('策略A: 静态扫描...');
+        var mainContent = document.querySelector('main, [role="main"], #__next, [id*="content"], [class*="content"]');
+        if (!mainContent && document.body) {
+            // 尝试找最大的主要内容区
+            var bodyChildren = document.body.children;
+            var maxArea = 0;
+            for (var bc = 0; bc < bodyChildren.length; bc++) {
+                var child = bodyChildren[bc];
+                if (child.tagName === 'SCRIPT' || child.tagName === 'STYLE' || child.tagName === 'LINK') continue;
+                if (child.id === 'oz-scraper') continue;
+                var r = child.getBoundingClientRect();
+                var area = r.width * r.height;
+                if (area > maxArea && r.top < window.innerHeight * 0.8) {
+                    maxArea = area;
+                    mainContent = child;
                 }
             }
         }
+        if (!mainContent) mainContent = document.body;
 
-        // 策略2: 找所有 a 标签中，字体较粗/较大的（CSS 特征）
-        if (l2Items.length < 3) {
-            var allA = document.querySelectorAll('a');
-            for (var a = 0; a < allA.length; a++) {
-                var el = allA[a];
-                if (el.closest('header, footer, nav[class*="header"], nav[class*="footer"]')) continue;
-
-                var txt = safeText(el);
-                var href = el.getAttribute('href') || '';
-                if (!txt || txt.length < 2 || txt.length > 60) continue;
-                if (!href || href === '/' || href === pagePath) continue;
-                if (/product|seller|my|cart|checkout/.test(href)) continue;
-
-                // 检查样式
-                var style = window.getComputedStyle(el);
-                var fw = parseInt(style.fontWeight) || 400;
-                var fs = parseFloat(style.fontSize) || 14;
-                var isBold = fw >= 600;
-                var isLarge = fs >= 15;
-
-                // 如果字体粗或大，且在页面中上部
-                var rect = el.getBoundingClientRect();
-                if ((isBold || isLarge) && rect.top > 100 && rect.top < 400) {
-                    if (!l2Seen[txt]) {
-                        l2Seen[txt] = true;
-                        l2Items.push({ name: txt, url: href, el: el });
-                    }
-                }
+        // 在主内容区找所有类目链接
+        var staticLinks = mainContent.querySelectorAll('a');
+        var staticCategories = [];
+        for (var sl = 0; sl < staticLinks.length; sl++) {
+            var a = staticLinks[sl];
+            if (a.closest('header, footer, [class*="header"], [class*="footer"], [class*="sidebar"]')) continue;
+            var txt = safeText(a);
+            var href = a.getAttribute('href') || '';
+            if (isCategoryLink(txt, href)) {
+                var dup = staticCategories.some(function(c) { return c.name === txt; });
+                if (!dup) staticCategories.push({ name: txt, url: href, el: a });
             }
         }
+        addLog('静态扫描找到 ' + staticCategories.length + ' 个类目链接');
 
-        // 策略3: 找页面中所有 heading 元素附近的分组
-        if (l2Items.length < 3) {
-            var headings = document.querySelectorAll('h2, h3, h4, h5, [class*="title"], [class*="heading"]');
-            for (var h = 0; h < headings.length; h++) {
-                var hd = headings[h];
-                var txt = safeText(hd);
-                if (!txt || txt.length < 2 || txt.length > 60) continue;
-                // 找 heading 内部的链接或 heading 后面的链接
-                var link = hd.querySelector('a');
-                if (!link) {
-                    // 找 heading 后面的第一个链接
-                    var next = hd.nextElementSibling;
-                    if (next && next.tagName === 'A') link = next;
-                }
-                var href = link ? (link.getAttribute('href') || '') : '';
-                if (!l2Seen[txt]) {
-                    l2Seen[txt] = true;
-                    l2Items.push({ name: txt, url: href, el: hd });
-                }
-            }
-        }
-
-        // 保存 L2
-        for (var i2 = 0; i2 < l2Items.length; i2++) {
-            var l2 = l2Items[i2];
-            if (seen[l2.name + '|2']) continue;
-            seen[l2.name + '|2'] = true;
+        // 静态链接 → L2 候选（排除 L1 自己）
+        for (var sc = 0; sc < staticCategories.length; sc++) {
+            var cat = staticCategories[sc];
+            if (cat.name === l1Name) continue;
+            if (seen[cat.name + '|2']) continue;
+            seen[cat.name + '|2'] = true;
             items.push({
                 id: generateId(),
-                name: l2.name,
-                nameZh: translateAll(l2.name),
-                level: 2,
-                parent: l1Name || '',
-                parentZh: translateAll(l1Name) || '',
-                url: l2.url || '',
-                scrapedAt: now
+                name: cat.name, nameZh: translateAll(cat.name),
+                level: 2, parent: l1Name, parentZh: translateAll(l1Name),
+                url: cat.url, scrapedAt: now
             });
-            addLog('  L2: ' + l2.name);
+            addLog('  L2(静态): ' + cat.name);
         }
 
         // ========================================================
-        // L3: 粗体/大号标题（分类区块标题）
-        // 如 "Крупная бытовая техника", "Техника для дома"
+        // 策略B：hover 触发子菜单，采集深层类目
         // ========================================================
-        var l3Items = [];
-        var l3Seen = {};
+        addLog('策略B: hover触发子菜单...');
 
-        // 策略：找 h2, h3, h4, h5, strong 等 heading 元素
-        var allHeadings = document.querySelectorAll('h2, h3, h4, h5, h6, strong, b, [class*="title"], [class*="heading"], [class*="subtitle"]');
-        for (var i3 = 0; i3 < allHeadings.length; i3++) {
-            var he = allHeadings[i3];
-            // 排除顶部导航
-            var rect3 = he.getBoundingClientRect();
-            if (rect3.top < 150) continue;
-            if (he.closest('header, footer, nav[class*="header"], [class*="footer"]')) continue;
+        // 先关闭所有已有的 popover（移动鼠标到角落）
+        var cornerEvent = new MouseEvent('mousemove', {
+            bubbles: true, cancelable: true, view: window,
+            clientX: 0, clientY: window.innerHeight
+        });
+        document.dispatchEvent(cornerEvent);
+        await sleep(300);
 
-            var txt3 = safeText(he);
-            if (!txt3 || txt3.length < 2 || txt3.length > 80) continue;
-            if (txt3 === l1Name) continue;
-            if (l2Seen[txt3]) continue; // 避免和 L2 重复
+        // B1: 找页面上所有需要 hover 的类目触发器元素
+        var triggers = [];
+        for (var ts = 0; ts < CAT_TRIGGER_SELECTORS.length; ts++) {
+            try {
+                var els = document.querySelectorAll(CAT_TRIGGER_SELECTORS[ts]);
+                for (var te = 0; te < els.length; te++) {
+                    var el = els[te];
+                    if (!isVisible(el)) continue;
+                    if (el.closest('header, footer')) continue;
+                    var txt = safeText(el);
+                    var href = el.getAttribute('href') || '';
+                    if (!txt || txt.length < 2 || txt === l1Name) continue;
+                    if (triggers.some(function(t) { return t.name === txt; })) continue;
+                    triggers.push({ name: txt, url: href, el: el });
+                }
+            } catch (e) {}
+        }
 
-            // 检查样式特征
-            var st = window.getComputedStyle(he);
-            var fw3 = parseInt(st.fontWeight) || 400;
-            var fs3 = parseFloat(st.fontSize) || 14;
+        // B2: 额外找 visual category cards（图片+文字的类目卡片）
+        var allDivs = document.querySelectorAll('div, section, article');
+        for (var dv = 0; dv < allDivs.length; dv++) {
+            var div = allDivs[dv];
+            if (!isVisible(div)) continue;
+            if (div.closest('header, footer, #oz-scraper')) continue;
+            // 找包含一个 category 链接和一个 img 的卡片型容器
+            var catLink = div.querySelector('a[href*="/category/"]');
+            if (!catLink) continue;
+            var txt = safeText(catLink);
+            if (!txt || txt.length < 2) continue;
+            if (triggers.some(function(t) { return t.name === txt; })) continue;
+            // 确认是卡片：相对紧凑的尺寸
+            var r = div.getBoundingClientRect();
+            if (r.width < 80 || r.width > 500 || r.height < 30 || r.height > 400) continue;
+            triggers.push({ name: txt, url: catLink.getAttribute('href') || '', el: catLink });
+        }
 
-            // L3 特征：字体较粗 或 字号较大 且 有下方链接跟随
-            var hasLinksBelow = false;
-            var parent = he.parentElement;
-            if (parent) {
-                var siblingLinks = parent.querySelectorAll('a');
-                for (var sl = 0; sl < siblingLinks.length; sl++) {
-                    var slTxt = safeText(siblingLinks[sl]);
-                    if (slTxt && slTxt.length > 1 && slTxt !== txt3) {
-                        hasLinksBelow = true;
-                        break;
+        addLog('发现 ' + triggers.length + ' 个hover触发点');
+
+        // B3: 逐个 hover，抓取弹出子菜单
+        var totalL3 = 0, totalL4 = 0;
+        var l3Links = {};  // parentName -> [links]
+
+        for (var tg = 0; tg < triggers.length; tg++) {
+            var trigger = triggers[tg];
+            if (!isRunning) break;
+
+            // 先移开鼠标关闭之前的 popover
+            document.dispatchEvent(new MouseEvent('mousemove', {
+                bubbles: true, cancelable: true, view: window,
+                clientX: 0, clientY: window.innerHeight
+            }));
+            await sleep(200);
+
+            // hover 触发器
+            simulateHover(trigger.el);
+            addLog('Hover: ' + trigger.name.substring(0, 30));
+
+            // 等待 popover 出现
+            var subLinks = await waitForPopover(1500);
+
+            if (subLinks.length > 0) {
+                addLog('  弹出 ' + subLinks.length + ' 个子类目');
+                l3Links[trigger.name] = subLinks;
+
+                // 添加为 L3
+                for (var sli = 0; sli < subLinks.length; sli++) {
+                    var slink = subLinks[sli];
+                    if (seen[slink.name + '|3']) continue;
+                    seen[slink.name + '|3'] = true;
+                    items.push({
+                        id: generateId(),
+                        name: slink.name, nameZh: translateAll(slink.name),
+                        level: 3, parent: trigger.name, parentZh: translateAll(trigger.name),
+                        url: slink.url, scrapedAt: now
+                    });
+                    totalL3++;
+                }
+
+                // B4: 在 popover 内 hover 每个 L3，尝试获取 L4
+                for (var sli2 = 0; sli2 < subLinks.length; sli2++) {
+                    if (!isRunning) break;
+                    var l3Link = subLinks[sli2];
+                    simulateHover(l3Link.el);
+                    await sleep(300);
+                    var l4SubLinks = await waitForPopover(1000);
+                    if (l4SubLinks.length > 0) {
+                        for (var l4i = 0; l4i < l4SubLinks.length; l4i++) {
+                            var l4link = l4SubLinks[l4i];
+                            // 跳过和 L3 同名的
+                            if (l4link.name === l3Link.name) continue;
+                            if (seen[l4link.name + '|4']) continue;
+                            seen[l4link.name + '|4'] = true;
+                            items.push({
+                                id: generateId(),
+                                name: l4link.name, nameZh: translateAll(l4link.name),
+                                level: 4, parent: l3Link.name, parentZh: translateAll(l3Link.name),
+                                url: l4link.url, scrapedAt: now
+                            });
+                            totalL4++;
+                        }
                     }
                 }
-            }
-
-            var isL3 = (fw3 >= 600 || fs3 >= 16 || hasLinksBelow) && txt3.length < 60;
-            if (isL3 && !l3Seen[txt3]) {
-                l3Seen[txt3] = true;
-                l3Items.push({ name: txt3, el: he });
+            } else {
+                addLog('  (无子菜单)');
             }
         }
 
-        // 保存 L3，并尝试关联 L2
-        for (var j3 = 0; j3 < l3Items.length; j3++) {
-            var l3 = l3Items[j3];
-            if (seen[l3.name + '|3']) continue;
-            seen[l3.name + '|3'] = true;
+        addLog('L3: ' + totalL3 + '  L4: ' + totalL4);
 
-            // 确定父级 L2：找最近的 L2 标题或在同一个容器内的 L2
-            var parentL2 = l1Name || '';
-            var parentEl = l3.el.parentElement;
-            if (parentEl) {
-                // 向上找是否在某个已知的 L2 容器内
-                for (var pl2 = 0; pl2 < l2Items.length; pl2++) {
-                    if (l2Items[pl2].el && parentEl.contains(l2Items[pl2].el)) {
-                        parentL2 = l2Items[pl2].name;
-                        break;
-                    }
-                }
-            }
-
-            items.push({
-                id: generateId(),
-                name: l3.name,
-                nameZh: translateAll(l3.name),
-                level: 3,
-                parent: parentL2,
-                parentZh: translateAll(parentL2),
-                url: '',
-                scrapedAt: now
-            });
-            addLog('    L3: ' + l3.name);
-
-            // ========================================================
-            // L4: L3 标题下方的链接列表（子类目）
-            // 如 "Холодильники", "Стиральные машины"
-            // ========================================================
-            var l3Parent = l3.el.parentElement;
-            if (!l3Parent) continue;
-
-            // 找同一个容器内的所有 a 标签（排除自身）
-            var childLinks = l3Parent.querySelectorAll('a');
-            // 或者找下一个兄弟元素中的链接
-            var nextSib = l3.el.nextElementSibling;
-            if (nextSib && nextSib.tagName !== 'A') {
-                childLinks = nextSib.querySelectorAll('a');
-            }
-
-            for (var c = 0; c < childLinks.length; c++) {
-                var cl = childLinks[c];
-                if (cl === l3.el) continue;
-                var cTxt = safeText(cl);
-                var cHref = cl.getAttribute('href') || '';
-                if (!cTxt || cTxt.length < 2 || cTxt.length > 80) continue;
-                if (cTxt === l3.name) continue;
-                if (seen[cTxt + '|4']) continue;
-                if (/product|seller|my|cart|checkout/.test(cHref)) continue;
-
-                seen[cTxt + '|4'] = true;
+        // ========================================================
+        // 策略C：如果 hover 也没拿到数据，走兜底
+        // ========================================================
+        if (items.length <= triggers.length + 1) {
+            addLog('策略C: 兜底扫描...');
+            // Hover 也没用，页面可能是静态类目列表。尝试导航到各子类目 URL。
+            // 暂时先扫描所有可见链接
+            var allVisibleAs = document.querySelectorAll('a');
+            for (var av = 0; av < allVisibleAs.length; av++) {
+                var avEl = allVisibleAs[av];
+                if (!isVisible(avEl)) continue;
+                if (avEl.closest('header, footer')) continue;
+                var avTxt = safeText(avEl);
+                var avHref = avEl.getAttribute('href') || '';
+                if (!isCategoryLink(avTxt, avHref)) continue;
+                if (avTxt === l1Name) continue;
+                // 检测层级：URL深的就是深层类目
+                var depth = (avHref.match(/\//g) || []).length;
+                var lvl = depth >= 5 ? 4 : depth >= 4 ? 3 : 2;
+                var key = avTxt + '|' + lvl;
+                if (seen[key]) continue;
+                seen[key] = true;
                 items.push({
                     id: generateId(),
-                    name: cTxt,
-                    nameZh: translateAll(cTxt),
-                    level: 4,
-                    parent: l3.name,
-                    parentZh: translateAll(l3.name),
-                    url: cHref,
-                    scrapedAt: now
+                    name: avTxt, nameZh: translateAll(avTxt),
+                    level: lvl, parent: l1Name, parentZh: translateAll(l1Name),
+                    url: avHref, scrapedAt: now
                 });
             }
         }
 
-        // ========================================================
-        // 兜底策略：如果上面都没找到 L3/L4，直接扫描所有链接
-        // ========================================================
-        if (items.length <= l2Items.length + 1) {
-            addLog('使用兜底策略扫描所有链接...');
-            var allLinks2 = document.querySelectorAll('a');
-            for (var al = 0; al < allLinks2.length; al++) {
-                var alEl = allLinks2[al];
-                if (alEl.closest('header, footer, nav[class*="header"], [class*="footer"]')) continue;
-
-                var alTxt = safeText(alEl);
-                var alHref = alEl.getAttribute('href') || '';
-                if (!alTxt || alTxt.length < 2 || alTxt.length > 80) continue;
-                if (alTxt === l1Name) continue;
-                if (l2Seen[alTxt]) continue;
-                if (/product|seller|my|cart|checkout/.test(alHref)) continue;
-                if (!alHref || alHref === '/') continue;
-
-                // 作为 L3/L4 保存
-                var lvl = seen[alTxt + '|3'] ? 4 : 3;
-                if (seen[alTxt + '|' + lvl]) continue;
-                seen[alTxt + '|' + lvl] = true;
-
-                items.push({
-                    id: generateId(),
-                    name: alTxt,
-                    nameZh: translateAll(alTxt),
-                    level: lvl,
-                    parent: l1Name || '',
-                    parentZh: translateAll(l1Name) || '',
-                    url: alHref,
-                    scrapedAt: now
-                });
-            }
+        // 统计
+        var l1c = 0, l2c = 0, l3c = 0, l4c = 0;
+        for (var ic = 0; ic < items.length; ic++) {
+            if (items[ic].level === 1) l1c++;
+            else if (items[ic].level === 2) l2c++;
+            else if (items[ic].level === 3) l3c++;
+            else if (items[ic].level === 4) l4c++;
         }
+        addLog('完成: L1=' + l1c + ' L2=' + l2c + ' L3=' + l3c + ' L4=' + l4c);
 
-        addLog('提取完成，共 ' + items.length + ' 条');
         return items;
     }
 
     // ============================================================
     // IndexedDB 存储
     // ============================================================
-    var DB_NAME = 'OzonCatTreeV6';
+    var DB_NAME = 'OzonCatTreeV7';
     var STORE_NAME = 'categories';
     var dbInstance = null;
 
@@ -882,7 +1010,7 @@
         panelEl.id = 'oz-scraper';
         panelEl.innerHTML = '<div class="oz-hd" id="oz-hd">' +
             '<div class="oz-lg">O</div>' +
-            '<div class="oz-tt">Ozon 类目采集 v6</div>' +
+            '<div class="oz-tt">Ozon 类目采集 v7</div>' +
             '<button class="oz-cl" id="oz-cl" title="关闭面板">✕</button>' +
             '</div>' +
             '<div class="oz-bd">' +
@@ -1018,7 +1146,7 @@
         if (!/ozon\.ru/.test(location.hostname)) return;
         if (/\/my\/|\/cart\/|\/checkout\//.test(location.pathname)) return;
 
-        console.log('[OzonCat] v6.0.0 boot', location.href);
+        console.log('[OzonCat] v7.0.0 boot', location.href);
         createPanel();
     }
 
