@@ -1,12 +1,11 @@
 // ==UserScript==
 // @name         Ozon Scraper - 产品类目爬取工具
 // @namespace    https://github.com/vision-png/ozon
-// @version      1.0.2
+// @version      1.0.3
 // @description  爬取 Ozon.ru 产品类目（3级）和搜索结果，支持 CSV/Excel 导出
 // @author       Qin Yucheng
 // @match        https://www.ozon.ru/*
 // @match        https://ozon.ru/*
-// @require      https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_deleteValue
@@ -533,31 +532,35 @@
     const DB_VERSION = 1;
     let dbInstance = null;
 
-    // Fallback: load SheetJS from alternative CDNs if primary failed
-    function loadSheetJSFallback() {
-        const fallbackUrls = [
+    // Dynamically load SheetJS for Excel export (on demand)
+    function loadSheetJSDynamic() {
+        const urls = [
             'https://cdn.bootcdn.net/ajax/libs/xlsx/0.20.3/xlsx.full.min.js',
             'https://unpkg.com/xlsx@0.20.3/dist/xlsx.full.min.js',
             'https://cdn.jsdelivr.net/npm/xlsx@0.20.3/dist/xlsx.full.min.js',
         ];
-        let idx = 0;
-        function tryNext() {
-            if (idx >= fallbackUrls.length) {
-                console.warn('[OzonScraper] All SheetJS CDNs failed. Excel export unavailable.');
-                return;
+        return new Promise((resolve) => {
+            let idx = 0;
+            function tryNext() {
+                if (idx >= urls.length) {
+                    console.warn('[OzonScraper] All SheetJS CDNs failed.');
+                    resolve(false);
+                    return;
+                }
+                const script = document.createElement('script');
+                script.src = urls[idx];
+                script.onload = () => {
+                    console.log('[OzonScraper] SheetJS loaded from', urls[idx]);
+                    resolve(true);
+                };
+                script.onerror = () => {
+                    idx++;
+                    tryNext();
+                };
+                document.head.appendChild(script);
             }
-            const script = document.createElement('script');
-            script.src = fallbackUrls[idx];
-            script.onload = () => {
-                console.log('[OzonScraper] SheetJS loaded from fallback:', fallbackUrls[idx]);
-            };
-            script.onerror = () => {
-                idx++;
-                tryNext();
-            };
-            document.head.appendChild(script);
-        }
-        tryNext();
+            tryNext();
+        });
     }
 
     function initDB() {
@@ -1312,9 +1315,14 @@
     async function exportExcel() {
         showNotification('正在导出 Excel...', 'info');
 
+        // Dynamically load SheetJS if not available
         if (typeof XLSX === 'undefined') {
-            showNotification('SheetJS 尚未加载，请刷新页面后重试', 'error');
-            return;
+            showNotification('正在加载 Excel 库...', 'info');
+            const ok = await loadSheetJSDynamic();
+            if (!ok) {
+                showNotification('Excel 库加载失败，请使用 CSV 导出', 'error');
+                return;
+            }
         }
 
         const products = await getAllProducts();
@@ -1471,12 +1479,6 @@
                 // nothing extra needed here; handled in onPageChange()
             };
 
-            // Warn if SheetJS failed to load (will affect Excel export only)
-            if (typeof XLSX === 'undefined') {
-                console.warn('[OzonScraper] SheetJS not loaded, trying fallback CDN...');
-                loadSheetJSFallback();
-            }
-
             logger.info('Ozon Scraper initialized successfully');
             showNotification('Ozon Scraper 已启动！', 'success');
         } catch (e) {
@@ -1485,57 +1487,24 @@
     }
 
     // ============================================================
-    // Section 19: Boot with error handling & retry
+    // Section 19: Boot — always show panel on Ozon pages
     // ============================================================
-    let initAttempts = 0;
-    const MAX_INIT_ATTEMPTS = 10;
-
     function safeInit() {
-        initAttempts++;
-        try {
-            // Check if panel already exists
-            if (document.getElementById('ozon-scraper-panel')) {
-                return;
-            }
+        if (document.getElementById('ozon-scraper-panel')) return;
 
-            const isOnSupportedPage = /ozon\.ru/.test(location.hostname) &&
-                !/\/my\//.test(location.pathname) &&
-                !/\/cart\//.test(location.pathname);
+        const isOzon = /ozon\.ru/.test(location.hostname);
+        const skip = /\/my\//.test(location.pathname) || /\/cart\//.test(location.pathname);
 
-            if (!isOnSupportedPage) {
-                console.log('[OzonScraper] Skipping unsupported page:', location.pathname);
-                return;
-            }
-
-            // Check if Ozon's React content has rendered
-            // Look for any meaningful content (product links OR category links OR search results)
-            const hasContent = document.querySelectorAll('a[href*="/product/"]').length > 0 ||
-                document.querySelectorAll('a[href*="/category/"]').length > 3 ||
-                document.querySelectorAll('a[href*="/brand/"]').length > 0 ||
-                document.querySelector('main') !== null;
-
-            if (!hasContent && initAttempts < MAX_INIT_ATTEMPTS) {
-                // Content not rendered yet, retry with backoff
-                setTimeout(safeInit, 800 * initAttempts);
-                return;
-            }
-
-            console.log('[OzonScraper] Boot attempt', initAttempts, '— initializing panel');
+        if (isOzon && !skip) {
+            console.log('[OzonScraper] Init on', location.pathname);
             init();
-        } catch (e) {
-            console.error('[OzonScraper] Init error:', e);
-            if (initAttempts < MAX_INIT_ATTEMPTS) {
-                setTimeout(safeInit, 1000);
-            }
         }
     }
 
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', () => {
-            setTimeout(safeInit, 800);
-        });
+        document.addEventListener('DOMContentLoaded', () => setTimeout(safeInit, 200));
     } else {
-        setTimeout(safeInit, 800);
+        setTimeout(safeInit, 200);
     }
 
 })();
