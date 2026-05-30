@@ -1016,7 +1016,7 @@
     function boot() {
         if (document.getElementById('oz-scraper')) return;
         if (!/ozon\.ru/.test(location.hostname)) return;
-        if (\/my\/|/cart/|/checkout/.test(location.pathname)) return;
+        if (/\/my\/|\/cart\/|\/checkout\//.test(location.pathname)) return;
 
         console.log('[OzonCat] v6.0.0 boot', location.href);
         createPanel();
