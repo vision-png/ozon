@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ozon Scraper - 产品类目爬取工具
 // @namespace    https://github.com/vision-png/ozon
-// @version      1.0.0
+// @version      1.0.2
 // @description  爬取 Ozon.ru 产品类目（3级）和搜索结果，支持 CSV/Excel 导出
 // @author       Qin Yucheng
 // @match        https://www.ozon.ru/*
@@ -532,6 +532,33 @@
     const DB_NAME = 'OzonScraperDB';
     const DB_VERSION = 1;
     let dbInstance = null;
+
+    // Fallback: load SheetJS from alternative CDNs if primary failed
+    function loadSheetJSFallback() {
+        const fallbackUrls = [
+            'https://cdn.bootcdn.net/ajax/libs/xlsx/0.20.3/xlsx.full.min.js',
+            'https://unpkg.com/xlsx@0.20.3/dist/xlsx.full.min.js',
+            'https://cdn.jsdelivr.net/npm/xlsx@0.20.3/dist/xlsx.full.min.js',
+        ];
+        let idx = 0;
+        function tryNext() {
+            if (idx >= fallbackUrls.length) {
+                console.warn('[OzonScraper] All SheetJS CDNs failed. Excel export unavailable.');
+                return;
+            }
+            const script = document.createElement('script');
+            script.src = fallbackUrls[idx];
+            script.onload = () => {
+                console.log('[OzonScraper] SheetJS loaded from fallback:', fallbackUrls[idx]);
+            };
+            script.onerror = () => {
+                idx++;
+                tryNext();
+            };
+            document.head.appendChild(script);
+        }
+        tryNext();
+    }
 
     function initDB() {
         if (dbInstance) return Promise.resolve(dbInstance);
@@ -1410,49 +1437,105 @@
     // Section 18: Main Entry Point
     // ============================================================
     function init() {
-        logger.info('Ozon Scraper initializing on:', location.href);
+        try {
+            logger.info('Ozon Scraper initializing on:', location.href);
 
-        // Check if we're on Ozon
-        const hostname = location.hostname;
-        if (!hostname.includes('ozon.ru')) {
-            logger.warn('Not on ozon.ru, skipping init');
-            return;
+            // Check if we're on Ozon
+            const hostname = location.hostname;
+            if (!hostname.includes('ozon.ru')) {
+                logger.warn('Not on ozon.ru, skipping init');
+                return;
+            }
+
+            // Patch SPA navigation
+            patchHistoryAPI();
+
+            // Create UI panel
+            createPanel();
+
+            // Set initial page type
+            const pageType = getCurrentPageType();
+            updatePanelForPageType(pageType);
+
+            // Setup MutationObserver
+            setupMutationObserver();
+
+            // Load existing products count
+            getAllProducts().then((products) => {
+                updateStatus(products.length);
+                logger.info(`Loaded ${products.length} existing products from DB`);
+            }).catch(() => {});
+
+            // Listen for page changes
+            onPageChangeCallback = (pageType, url) => {
+                // nothing extra needed here; handled in onPageChange()
+            };
+
+            // Warn if SheetJS failed to load (will affect Excel export only)
+            if (typeof XLSX === 'undefined') {
+                console.warn('[OzonScraper] SheetJS not loaded, trying fallback CDN...');
+                loadSheetJSFallback();
+            }
+
+            logger.info('Ozon Scraper initialized successfully');
+            showNotification('Ozon Scraper 已启动！', 'success');
+        } catch (e) {
+            console.error('[OzonScraper] Fatal init error:', e);
         }
-
-        // Patch SPA navigation
-        patchHistoryAPI();
-
-        // Create UI panel
-        createPanel();
-
-        // Set initial page type
-        const pageType = getCurrentPageType();
-        updatePanelForPageType(pageType);
-
-        // Setup MutationObserver
-        setupMutationObserver();
-
-        // Load existing products count
-        getAllProducts().then((products) => {
-            updateStatus(products.length);
-            logger.info(`Loaded ${products.length} existing products from DB`);
-        }).catch(() => {});
-
-        // Listen for page changes
-        onPageChangeCallback = (pageType, url) => {
-            // nothing extra needed here; handled in onPageChange()
-        };
-
-        logger.info('Ozon Scraper initialized successfully');
-        showNotification('Ozon Scraper 已启动！', 'success');
     }
 
-    // Wait for DOM ready, then init
+    // ============================================================
+    // Section 19: Boot with error handling & retry
+    // ============================================================
+    let initAttempts = 0;
+    const MAX_INIT_ATTEMPTS = 10;
+
+    function safeInit() {
+        initAttempts++;
+        try {
+            // Check if panel already exists
+            if (document.getElementById('ozon-scraper-panel')) {
+                return;
+            }
+
+            const isOnSupportedPage = /ozon\.ru/.test(location.hostname) &&
+                !/\/my\//.test(location.pathname) &&
+                !/\/cart\//.test(location.pathname);
+
+            if (!isOnSupportedPage) {
+                console.log('[OzonScraper] Skipping unsupported page:', location.pathname);
+                return;
+            }
+
+            // Check if Ozon's React content has rendered
+            // Look for any meaningful content (product links OR category links OR search results)
+            const hasContent = document.querySelectorAll('a[href*="/product/"]').length > 0 ||
+                document.querySelectorAll('a[href*="/category/"]').length > 3 ||
+                document.querySelectorAll('a[href*="/brand/"]').length > 0 ||
+                document.querySelector('main') !== null;
+
+            if (!hasContent && initAttempts < MAX_INIT_ATTEMPTS) {
+                // Content not rendered yet, retry with backoff
+                setTimeout(safeInit, 800 * initAttempts);
+                return;
+            }
+
+            console.log('[OzonScraper] Boot attempt', initAttempts, '— initializing panel');
+            init();
+        } catch (e) {
+            console.error('[OzonScraper] Init error:', e);
+            if (initAttempts < MAX_INIT_ATTEMPTS) {
+                setTimeout(safeInit, 1000);
+            }
+        }
+    }
+
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', init);
+        document.addEventListener('DOMContentLoaded', () => {
+            setTimeout(safeInit, 800);
+        });
     } else {
-        // Small delay to let React render
-        setTimeout(init, 500);
+        setTimeout(safeInit, 800);
     }
 
 })();
